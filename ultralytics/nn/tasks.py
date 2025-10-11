@@ -135,7 +135,7 @@ class BaseModel(torch.nn.Module):
             (torch.Tensor): Loss if x is a dict (training), or network predictions (inference).
         """
         if isinstance(x, dict):  # for cases of training and validating while training.
-            return self.loss(x, *args, **kwargs)
+            return self.losswithpreds(x, *args, **kwargs)
         return self.predict(x, *args, **kwargs)
 
     def predict(self, x, profile=False, visualize=False, augment=False, embed=None):
@@ -337,6 +337,20 @@ class BaseModel(torch.nn.Module):
         preds = self.forward(batch["img"]) if preds is None else preds
         return self.criterion(preds, batch)
 
+    def losswithpreds(self, batch, preds=None):
+        """
+        Compute loss.
+
+        Args:
+            batch (dict): Batch to compute loss on.
+            preds (torch.Tensor | List[torch.Tensor], optional): Predictions.
+        """
+        if getattr(self, "criterion", None) is None:
+            self.criterion = self.init_criterion()
+
+        preds = self.forward(batch["img"]) if preds is None else preds
+        return self.criterion(preds, batch), preds
+    
     def init_criterion(self):
         """Initialize the loss criterion for the BaseModel."""
         raise NotImplementedError("compute_loss() needs to be implemented by task heads")

@@ -403,7 +403,10 @@ class BaseTrainer:
                 # Forward
                 with autocast(self.amp):
                     batch = self.preprocess_batch(batch)
-                    loss, self.loss_items = self.model(batch)
+                    # loss, self.loss_items = self.model(batch)
+                    testing = self.model(batch)
+                    loss, self.loss_items = testing[0]
+                    preds = testing[1]
                     self.loss = loss.sum()
                     if RANK != -1:
                         self.loss *= world_size

@@ -255,6 +255,11 @@ class BaseTrainer:
         self.model = self.model.to(self.device)
         self.set_model_attributes()
 
+        self.secondary_model = attempt_load_one_weight("yolov11n.yaml")[0].to(self.device)
+        self.secondary_model.eval()  # inference mode
+        for p in self.secondary_model.parameters():
+            p.requires_grad = False  # freeze
+
         # Freeze layers
         freeze_list = (
             self.args.freeze
@@ -407,6 +412,9 @@ class BaseTrainer:
                     testing = self.model(batch)
                     loss, self.loss_items = testing[0]
                     preds = testing[1]
+                    # ➕ Additional frozen YOLO model
+                    with torch.no_grad():
+                        secondary_out = self.secondary_model(batch)
                     self.loss = loss.sum()
                     if RANK != -1:
                         self.loss *= world_size

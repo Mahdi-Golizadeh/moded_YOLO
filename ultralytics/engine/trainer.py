@@ -15,6 +15,7 @@ import warnings
 from copy import copy, deepcopy
 from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -117,6 +118,112 @@ class BaseTrainer:
             _callbacks (list, optional): List of callback functions.
         """
         self.args = get_cfg(cfg, overrides)
+        self.teacher_args = SimpleNamespace(
+            mode="val",
+            model="yolo11n.pt",
+            data="/content/ultralytics/cfg/datasets/coco8.yaml",
+            epochs=2,
+            time=None,
+            patience=100,
+            batch=16,
+            imgsz=640,
+            save=True,
+            save_period=-1,
+            cache=False,
+            device="cpu",
+            workers=0,
+            project=None,
+            name="train32",
+            exist_ok=False,
+            pretrained=True,
+            optimizer="auto",
+            verbose=True,
+            seed=0,
+            deterministic=True,
+            single_cls=False,
+            rect=False,
+            cos_lr=False,
+            close_mosaic=10,
+            resume=False,
+            amp=True,
+            fraction=1.0,
+            profile=False,
+            freeze=None,
+            multi_scale=False,
+            overlap_mask=True,
+            mask_ratio=4,
+            dropout=0.0,
+            val=True,
+            split="val",
+            save_json=False,
+            conf=None,
+            iou=0.7,
+            max_det=300,
+            half=False,
+            dnn=False,
+            plots=True,
+            source=None,
+            vid_stride=1,
+            stream_buffer=False,
+            visualize=False,
+            augment=False,
+            agnostic_nms=False,
+            classes=None,
+            retina_masks=False,
+            embed=None,
+            show=False,
+            save_frames=False,
+            save_txt=False,
+            save_conf=False,
+            save_crop=False,
+            show_labels=True,
+            show_conf=True,
+            show_boxes=True,
+            line_width=None,
+            format="torchscript",
+            keras=False,
+            optimize=False,
+            int8=False,
+            dynamic=False,
+            simplify=True,
+            opset=None,
+            workspace=None,
+            nms=False,
+            lr0=0.01,
+            lrf=0.01,
+            momentum=0.937,
+            weight_decay=0.0005,
+            warmup_epochs=3.0,
+            warmup_momentum=0.8,
+            warmup_bias_lr=0.0,
+            box=7.5,
+            cls=0.5,
+            dfl=1.5,
+            pose=12.0,
+            kobj=1.0,
+            nbs=64,
+            hsv_h=0.015,
+            hsv_s=0.7,
+            hsv_v=0.4,
+            degrees=0.0,
+            translate=0.1,
+            scale=0.5,
+            shear=0.0,
+            perspective=0.0,
+            flipud=0.0,
+            fliplr=0.5,
+            bgr=0.0,
+            mosaic=1.0,
+            mixup=0.0,
+            cutmix=0.0,
+            copy_paste=0.0,
+            copy_paste_mode="flip",
+            auto_augment="randaugment",
+            erasing=0.4,
+            cfg=None,
+            tracker="botsort.yaml",
+            save_dir="runs/detect/train32",
+        )
         self.check_resume(overrides)
         self.device = select_device(self.args.device, self.args.batch)
         # Update "-1" devices so post-training val does not repeat search
@@ -177,6 +284,8 @@ class BaseTrainer:
             callbacks.add_integration_callbacks(self)
             # Start console logging immediately at trainer initialization
             self.run_callbacks("on_pretrain_routine_start")
+
+        # self.teacher.args = self.args
 
     def add_callback(self, event: str, callback):
         """Append the given callback to the event's callback list."""
@@ -257,12 +366,12 @@ class BaseTrainer:
         self.set_model_attributes()
 
         ckpt_teacher = self.setup_teacher()
+        self.teacher.args = self.teacher_args
         self.teacher = self.teacher.to(self.device)
-
-        # self.secondary_model = attempt_load_one_weight("yolov11n.pt")[0].to(self.device)
-        # self.secondary_model.eval()  # inference mode
-        # for p in self.secondary_model.parameters():
-        #     p.requires_grad = False  # freeze
+        self.set_teacher_attributes()
+        for p in self.teacher.parameters():
+            p.requires_grad = False
+        self.teacher.eval()
 
         # Freeze layers
         freeze_list = (
@@ -414,12 +523,13 @@ class BaseTrainer:
                     batch = self.preprocess_batch(batch)
                     # loss, self.loss_items = self.model(batch)
                     testing = self.model(batch)
-                    t1 = self.teacher(batch)
+                    # print(self.teacher.args)
+                    with torch.no_grad():
+                        t1 = self.teacher(batch)
+                    print(all(not p.requires_grad for p in self.teacher.parameters()))
                     loss, self.loss_items = testing[0]
                     preds = testing[1]
-                    # ➕ Additional frozen YOLO model
-                    # with torch.no_grad():
-                    #     secondary_out = self.secondary_model(batch)
+                    
                     self.loss = loss.sum()
                     if RANK != -1:
                         self.loss *= world_size
@@ -677,7 +787,7 @@ class BaseTrainer:
             cfg = weights.yaml
         elif isinstance(self.args.pretrained, (str, Path)):
             weights, _ = attempt_load_one_weight(self.args.pretrained)
-        self.model = self.get_model(cfg=cfg, weights=weights, verbose=RANK == -1)  # calls Model(cfg, weights)
+        self.teacher = self.get_model(cfg=cfg, weights=weights, verbose=RANK == -1)  # calls Model(cfg, weights)
         return ckpt
 
     def optimizer_step(self):
@@ -736,6 +846,10 @@ class BaseTrainer:
     def set_model_attributes(self):
         """Set or update model parameters before training."""
         self.model.names = self.data["names"]
+
+    def set_teacher_attributes(self):
+        """Set or update model parameters before training."""
+        self.teacher.names = self.data["names"]
 
     def build_targets(self, preds, targets):
         """Build target tensors for training YOLO model."""

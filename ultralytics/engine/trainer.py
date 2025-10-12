@@ -149,6 +149,7 @@ class BaseTrainer:
 
         # Model and Dataset
         self.model = check_model_file_from_stem(self.args.model)  # add suffix, i.e. yolo11n -> yolo11n.pt
+        self.teacher = check_model_file_from_stem("yolo11n.yaml")
         with torch_distributed_zero_first(LOCAL_RANK):  # avoid auto-downloading dataset multiple times
             self.data = self.get_dataset()
 
@@ -255,10 +256,13 @@ class BaseTrainer:
         self.model = self.model.to(self.device)
         self.set_model_attributes()
 
-        self.secondary_model = attempt_load_one_weight("yolov11n.yaml")[0].to(self.device)
-        self.secondary_model.eval()  # inference mode
-        for p in self.secondary_model.parameters():
-            p.requires_grad = False  # freeze
+        ckpt_teacher = self.setup_teacher()
+        self.teacher = self.teacher.to(self.device)
+
+        # self.secondary_model = attempt_load_one_weight("yolov11n.pt")[0].to(self.device)
+        # self.secondary_model.eval()  # inference mode
+        # for p in self.secondary_model.parameters():
+        #     p.requires_grad = False  # freeze
 
         # Freeze layers
         freeze_list = (
@@ -410,11 +414,12 @@ class BaseTrainer:
                     batch = self.preprocess_batch(batch)
                     # loss, self.loss_items = self.model(batch)
                     testing = self.model(batch)
+                    t1 = self.teacher(batch)
                     loss, self.loss_items = testing[0]
                     preds = testing[1]
                     # ➕ Additional frozen YOLO model
-                    with torch.no_grad():
-                        secondary_out = self.secondary_model(batch)
+                    # with torch.no_grad():
+                    #     secondary_out = self.secondary_model(batch)
                     self.loss = loss.sum()
                     if RANK != -1:
                         self.loss *= world_size
@@ -649,6 +654,26 @@ class BaseTrainer:
         ckpt = None
         if str(self.model).endswith(".pt"):
             weights, ckpt = attempt_load_one_weight(self.model)
+            cfg = weights.yaml
+        elif isinstance(self.args.pretrained, (str, Path)):
+            weights, _ = attempt_load_one_weight(self.args.pretrained)
+        self.model = self.get_model(cfg=cfg, weights=weights, verbose=RANK == -1)  # calls Model(cfg, weights)
+        return ckpt
+    
+    def setup_teacher(self):
+        """
+        Load, create, or download model for any task.
+
+        Returns:
+            (dict): Optional checkpoint to resume training from.
+        """
+        if isinstance(self.teacher, torch.nn.Module):  # if model is loaded beforehand. No setup needed
+            return
+
+        cfg, weights = self.teacher, None
+        ckpt = None
+        if str(self.teacher).endswith(".pt"):
+            weights, ckpt = attempt_load_one_weight(self.teacher)
             cfg = weights.yaml
         elif isinstance(self.args.pretrained, (str, Path)):
             weights, _ = attempt_load_one_weight(self.args.pretrained)

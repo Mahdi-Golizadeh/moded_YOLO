@@ -119,8 +119,8 @@ class BaseTrainer:
         """
         self.args = get_cfg(cfg, overrides)
         self.teacher_args = SimpleNamespace(
-            mode="val",
-            model="yolo11n.pt",
+            mode="train",
+            model="yolo11n.yaml",
             data="/content/ultralytics/cfg/datasets/coco8.yaml",
             epochs=2,
             time=None,
@@ -256,7 +256,7 @@ class BaseTrainer:
 
         # Model and Dataset
         self.model = check_model_file_from_stem(self.args.model)  # add suffix, i.e. yolo11n -> yolo11n.pt
-        self.teacher = check_model_file_from_stem("yolo11n.yaml")
+        self.teacher = check_model_file_from_stem(self.teacher_args.model)
         with torch_distributed_zero_first(LOCAL_RANK):  # avoid auto-downloading dataset multiple times
             self.data = self.get_dataset()
 
@@ -371,7 +371,7 @@ class BaseTrainer:
         self.set_teacher_attributes()
         for p in self.teacher.parameters():
             p.requires_grad = False
-        self.teacher.eval()
+        # self.teacher.eval()
 
         # Freeze layers
         freeze_list = (
@@ -523,9 +523,11 @@ class BaseTrainer:
                     batch = self.preprocess_batch(batch)
                     # loss, self.loss_items = self.model(batch)
                     testing = self.model(batch)
-                    # print(self.teacher.args)
+                    print(testing[0][0].requires_grad, testing[0][1].requires_grad, testing[1][0].requires_grad)
                     with torch.no_grad():
                         t1 = self.teacher(batch)
+                    print(t1[0][0].requires_grad, t1[0][1].requires_grad, t1[1][0].requires_grad)
+                    # print(t1[0][0],t1[0][1],t1[1][0].shape,len(t1[1][1]),sep="\n")
                     print(all(not p.requires_grad for p in self.teacher.parameters()))
                     loss, self.loss_items = testing[0]
                     preds = testing[1]

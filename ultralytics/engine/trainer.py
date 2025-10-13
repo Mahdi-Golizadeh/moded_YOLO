@@ -522,7 +522,8 @@ class BaseTrainer:
                 # Forward
                 with autocast(self.amp):
                     batch = self.preprocess_batch(batch)
-                    
+            
+                    progress = (epoch + 1) / self.args.epochs
                     # Forward pass through student and teacher
                     testing = self.model(batch)
                     with torch.no_grad():
@@ -535,10 +536,14 @@ class BaseTrainer:
 
                     # --- Distillation setup ---
                     class_channels = 80
-                    per_scale_weights = [1.0, 1.0, 1.0]
-                    teacher_conf_thresh = 0.3  # only distill confident teacher regions
-                    alpha = 0.5                # scale factor for KD term
-                    T = 2.0                     # optional temperature
+                    per_scale_weights = [
+                                            1.5 - 0.5 * progress,  # small objects
+                                            1.0,                   # medium
+                                            0.5 + 0.5 * progress,  # large objects
+                                        ]
+                    teacher_conf_thresh = 0.5 - 0.3 * min(1.0, progress * 1.5)  # only distill confident teacher regions
+                    alpha = 0.01 + 0.09 * min(1.0, progress * 2.0)  # saturates at 0.1 halfway through                # scale factor for KD term
+                    T = 3.0 - 1.5 * min(1.0, progress * 1.5)                     # optional temperature
 
                     distill_cls_loss = 0.0
 
@@ -561,12 +566,12 @@ class BaseTrainer:
 
                             # ✅ Normalize by number of active elements × classes
                             active_elems = mask.sum() * class_channels + 1e-6
-                            loss = (bce * mask).sum() / active_elems
+                            loss_ = (bce * mask).sum() / active_elems
                         else:
-                            loss = F.binary_cross_entropy_with_logits(s_logits, t_probs, reduction='mean')
+                            loss_ = F.binary_cross_entropy_with_logits(s_logits, t_probs, reduction='mean')
 
                         # Weighted accumulation across scales
-                        distill_cls_loss += per_scale_weights[i] * loss
+                        distill_cls_loss += per_scale_weights[i] * loss_
 
                     # --- Combine total losses ---
                     self.loss = loss.sum()  # original YOLO loss

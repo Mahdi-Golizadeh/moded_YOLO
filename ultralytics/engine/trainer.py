@@ -129,7 +129,7 @@ class BaseTrainer:
             imgsz=self.args.imgsz,
             save=self.args.save,
             save_period=self.args.save_period,
-            cache=self.cache,
+            cache=False,
             device=self.args.device,
             workers=self.args.workers,
             project=self.args.project,

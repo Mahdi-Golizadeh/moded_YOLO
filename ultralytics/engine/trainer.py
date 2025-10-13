@@ -121,7 +121,7 @@ class BaseTrainer:
         self.args = get_cfg(cfg, overrides)
         self.teacher_args = SimpleNamespace(
             mode="train",
-            model="yolo11n.yaml",
+            model="yolo11n.pt",
             data=self.args.data,
             epochs=self.args.epochs,
             time=self.args.time,
@@ -522,61 +522,59 @@ class BaseTrainer:
                 # Forward
                 with autocast(self.amp):
                     batch = self.preprocess_batch(batch)
-                    # loss, self.loss_items = self.model(batch) original code 
+                    
+                    # Forward pass through student and teacher
                     testing = self.model(batch)
-                    # print(testing[0][0].requires_grad, testing[0][1].requires_grad, testing[1][0].requires_grad)
                     with torch.no_grad():
                         t1 = self.teacher(batch)
-                    # print(t1[0][0].requires_grad, t1[0][1].requires_grad, t1[1][0].requires_grad)
-                    # print(t1[0][0],t1[0][1],t1[1][0].shape,len(t1[1][1]),sep="\n")
-                    # print(all(not p.requires_grad for p in self.teacher.parameters()))
+
+                    # Standard YOLO loss & predictions
                     loss, self.loss_items = testing[0]
                     preds = testing[1]
-                    print(preds[0].shape, preds[1].shape, preds[2].shape)
-                    # distillation process starts here
                     teacher_preds = t1[1]
-                    print(teacher_preds[0].shape, teacher_preds[1].shape, teacher_preds[2].shape,)
-                    # Number of classes in your model (COCO = 80)
+
+                    # --- Distillation setup ---
                     class_channels = 80
-
-                    # Optional weighting per detection scale (small/medium/large)
                     per_scale_weights = [1.0, 1.0, 1.0]
+                    teacher_conf_thresh = 0.3  # only distill confident teacher regions
+                    alpha = 0.5                # scale factor for KD term
+                    T = 2.0                     # optional temperature
 
-                    # Optional confidence threshold for teacher (to mask uncertain regions)
-                    teacher_conf_thresh = 0.3
-
-                    # Initialize total distillation loss
                     distill_cls_loss = 0.0
 
                     for i, (s_pred, t_pred) in enumerate(zip(preds, teacher_preds)):
                         # --- Extract class logits (first 80 channels) ---
-                        s_logits = s_pred[:, :class_channels, :, :]   # student logits
-                        t_logits = t_pred[:, :class_channels, :, :]   # teacher logits
+                        s_logits = s_pred[:, :class_channels, :, :]
+                        t_logits = t_pred[:, :class_channels, :, :]
 
-                        # --- Compute teacher probabilities (sigmoid, detached) ---
-                        t_probs = torch.sigmoid(t_logits)
+                        # --- Compute teacher probabilities (sigmoid + temperature smoothing) ---
+                        with torch.no_grad():
+                            t_probs = torch.sigmoid(t_logits / T)
 
-                        # --- Optional teacher confidence mask ---
+                        # --- Optional confidence mask ---
                         if teacher_conf_thresh > 0.0:
-                            # Maximum class probability per location
-                            t_max, _ = t_probs.max(dim=1, keepdim=True)  # [N, 1, H, W]
+                            t_max, _ = t_probs.max(dim=1, keepdim=True)
                             mask = (t_max >= teacher_conf_thresh).float()
 
                             # Binary cross-entropy between logits and teacher probs
                             bce = F.binary_cross_entropy_with_logits(s_logits, t_probs, reduction='none')
 
-                            # Apply mask — only distill where teacher is confident
-                            loss = (bce * mask).sum() / (mask.sum() + 1e-6)
+                            # ✅ Normalize by number of active elements × classes
+                            active_elems = mask.sum() * class_channels + 1e-6
+                            loss = (bce * mask).sum() / active_elems
                         else:
-                            # Simple mean BCE if no masking
                             loss = F.binary_cross_entropy_with_logits(s_logits, t_probs, reduction='mean')
 
                         # Weighted accumulation across scales
                         distill_cls_loss += per_scale_weights[i] * loss
-                    # now calculating loss with cls distillation
-                    alpha = .5 
-                    self.loss = loss.sum()
-                    self.loss += alpha * distill_cls_loss
+
+                    # --- Combine total losses ---
+                    self.loss = loss.sum()  # original YOLO loss
+                    self.loss += alpha * distill_cls_loss  # add normalized distillation loss
+
+                    # Optional logging/debug
+                    print(f"Distill loss (normalized): {distill_cls_loss.item():.4f}")
+
                     # distillation ends here
                     # self.loss = loss.sum()
                     if RANK != -1:

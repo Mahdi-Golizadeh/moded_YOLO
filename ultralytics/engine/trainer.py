@@ -583,49 +583,98 @@ class BaseTrainer:
 
                     # # distillation ends here
                     #----- dfl distillation starts here-----
+                    # num_classes = 80
+                    # reg_max = 16
+                    # T = 2
+                    # lambda_d = .5
+                    # distill_loss = 0
+                    # count = 0
+                    # for scale_idx in range(len(preds)):
+                    #     sp = preds[scale_idx]  # [B, Ctot, H, W]
+                    #     tp = teacher_preds[scale_idx]  # same shape
+                    
+                    #     B, Ctot, H, W = sp.shape
+                    #     # Extract only the DFL logits (distribution channels)
+                    #     sp = sp[:, num_classes:, :, :]  # [B, 4*reg_max, H, W]
+                    #     tp = tp[:, num_classes:, :, :]  # same
+                        
+                    #     # Reshape to separate sides and bins: → [B, H, W, 4, reg_max]
+                    #     sp = sp.view(B, 4, reg_max, H, W).permute(0, 3, 4, 1, 2)
+                    #     tp = tp.view(B, 4, reg_max, H, W).permute(0, 3, 4, 1, 2)
+
+                    #     # Flatten to shape [B * H * W * 4, reg_max]
+                    #     sp = sp.reshape(-1, reg_max)
+                    #     tp = tp.reshape(-1, reg_max)
+
+                    #     # Compute teacher soft distribution and student log-soft
+                    #     sp = torch.log_softmax(sp / T, dim=-1)        # [N_sel, reg_max]
+                    #     tp = torch.softmax(tp / T, dim=-1)   # [N_sel, reg_max]
+
+                    #     # KL divergence: KL(pt || ps) with reduction batchmean
+                    #     # Multiply by T^2 per distillation convention
+                    #     loss_kl = torch.nn.functional.kl_div(sp, tp, reduction='batchmean') * (T * T)
+
+                    #     distill_loss += loss_kl
+                    #     count += 1
+
+                    # # average across scales
+                    # if count > 0:
+                    #     distill_loss = distill_loss / count
+
+                    # # weight it
+                    # distill_loss = lambda_d * distill_loss
+                    # print(distill_loss)
+                    # self.loss = loss.sum()
+                    # self.loss += distill_loss
+                    # # dfl distillation ends here
+                    # regression distillation starts here
                     num_classes = 80
                     reg_max = 16
-                    T = 2
-                    lambda_d = .5
-                    distill_loss = 0
+                    λ_box_reg = 1.0  # weighting for box regression loss
+
+                    box_reg_loss = 0
                     count = 0
+
                     for scale_idx in range(len(preds)):
                         sp = preds[scale_idx]  # [B, Ctot, H, W]
                         tp = teacher_preds[scale_idx]  # same shape
                     
                         B, Ctot, H, W = sp.shape
-                        # Extract only the DFL logits (distribution channels)
                         sp = sp[:, num_classes:, :, :]  # [B, 4*reg_max, H, W]
-                        tp = tp[:, num_classes:, :, :]  # same
-                        
-                        # Reshape to separate sides and bins: → [B, H, W, 4, reg_max]
+                        tp = tp[:, num_classes:, :, :]  # [B, 4*reg_max, H, W]
+
+                        # reshape to separate 4 sides and bins → [B, H, W, 4, reg_max]
                         sp = sp.view(B, 4, reg_max, H, W).permute(0, 3, 4, 1, 2)
                         tp = tp.view(B, 4, reg_max, H, W).permute(0, 3, 4, 1, 2)
 
-                        # Flatten to shape [B * H * W * 4, reg_max]
-                        sp = sp.reshape(-1, reg_max)
+                        # flatten for convenience
+                        sp = sp.reshape(-1, reg_max)  # [B*H*W*4, reg_max]
                         tp = tp.reshape(-1, reg_max)
 
-                        # Compute teacher soft distribution and student log-soft
-                        sp = torch.log_softmax(sp / T, dim=-1)        # [N_sel, reg_max]
-                        tp = torch.softmax(tp / T, dim=-1)   # [N_sel, reg_max]
+                        # convert logits → probabilities
+                        sp = torch.softmax(sp, dim=-1)
+                        tp = torch.softmax(tp, dim=-1)
 
-                        # KL divergence: KL(pt || ps) with reduction batchmean
-                        # Multiply by T^2 per distillation convention
-                        loss_kl = torch.nn.functional.kl_div(sp, tp, reduction='batchmean') * (T * T)
+                        # compute expected continuous offsets for each side
+                        bins = torch.arange(reg_max, device=self.device,).unsqueeze(0)  # [1, reg_max]
+                        sp = torch.sum(sp * bins, dim=-1)  # [N_sel]
+                        tp = torch.sum(tp * bins, dim=-1)  # [N_sel]
 
-                        distill_loss += loss_kl
+                        # L2 (mean squared error) between offsets
+                        loss_reg = F.mse_loss(sp, tp, reduction='mean')
+
+                        box_reg_loss += loss_reg
                         count += 1
 
-                    # average across scales
                     if count > 0:
-                        distill_loss = distill_loss / count
+                        box_reg_loss = box_reg_loss / count
 
-                    # weight it
-                    distill_loss = lambda_d * distill_loss
-                    print(distill_loss)
+                    box_reg_loss = λ_box_reg * box_reg_loss
+
+                    print("L2 box regression loss:", box_reg_loss.item())
                     self.loss = loss.sum()
-                    self.loss += distill_loss
+                    self.loss += box_reg_loss
+                    #regression distillation ends here
                     # self.loss = loss.sum()
                     if RANK != -1:
                         self.loss *= world_size

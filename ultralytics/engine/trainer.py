@@ -18,6 +18,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+from pandas.io.api import to_pickle
 import torch
 import torch.nn.functional as F
 from torch import distributed as dist
@@ -534,53 +535,97 @@ class BaseTrainer:
                     preds = testing[1]
                     teacher_preds = t1[1]
 
-                    # --- Distillation setup ---
-                    class_channels = 80
-                    per_scale_weights = [
-                                            1.5 - 0.5 * progress,  # small objects
-                                            1.0,                   # medium
-                                            0.5 + 0.5 * progress,  # large objects
-                                        ]
-                    teacher_conf_thresh = 0.5 - 0.3 * min(1.0, progress * 1.5)  # only distill confident teacher regions
-                    alpha = 0.01 + 0.09 * min(1.0, progress * 2.0)  # saturates at 0.1 halfway through                # scale factor for KD term
-                    T = 3.0 - 1.5 * min(1.0, progress * 1.5)                     # optional temperature
+                    # # --- class Distillation setup ---
+                    # class_channels = 80
+                    # per_scale_weights = [
+                    #                         1.5 - 0.5 * progress,  # small objects
+                    #                         1.0,                   # medium
+                    #                         0.5 + 0.5 * progress,  # large objects
+                    #                     ]
+                    # teacher_conf_thresh = 0.5 - 0.3 * min(1.0, progress * 1.5)  # only distill confident teacher regions
+                    # alpha = 0.01 + 0.09 * min(1.0, progress * 2.0)  # saturates at 0.1 halfway through                # scale factor for KD term
+                    # T = 3.0 - 1.5 * min(1.0, progress * 1.5)                     # optional temperature
 
-                    distill_cls_loss = 0.0
+                    # distill_cls_loss = 0.0
 
-                    for i, (s_pred, t_pred) in enumerate(zip(preds, teacher_preds)):
-                        # --- Extract class logits (first 80 channels) ---
-                        s_logits = s_pred[:, :class_channels, :, :]
-                        t_logits = t_pred[:, :class_channels, :, :]
+                    # for i, (s_pred, t_pred) in enumerate(zip(preds, teacher_preds)):
+                    #     # --- Extract class logits (first 80 channels) ---
+                    #     s_logits = s_pred[:, :class_channels, :, :]
+                    #     t_logits = t_pred[:, :class_channels, :, :]
 
-                        # --- Compute teacher probabilities (sigmoid + temperature smoothing) ---
-                        with torch.no_grad():
-                            t_probs = torch.sigmoid(t_logits / T)
+                    #     # --- Compute teacher probabilities (sigmoid + temperature smoothing) ---
+                    #     with torch.no_grad():
+                    #         t_probs = torch.sigmoid(t_logits / T)
 
-                        # --- Optional confidence mask ---
-                        if teacher_conf_thresh > 0.0:
-                            t_max, _ = t_probs.max(dim=1, keepdim=True)
-                            mask = (t_max >= teacher_conf_thresh).float()
+                    #     # --- Optional confidence mask ---
+                    #     if teacher_conf_thresh > 0.0:
+                    #         t_max, _ = t_probs.max(dim=1, keepdim=True)
+                    #         mask = (t_max >= teacher_conf_thresh).float()
 
-                            # Binary cross-entropy between logits and teacher probs
-                            bce = F.binary_cross_entropy_with_logits(s_logits, t_probs, reduction='none')
+                    #         # Binary cross-entropy between logits and teacher probs
+                    #         bce = F.binary_cross_entropy_with_logits(s_logits, t_probs, reduction='none')
 
-                            # ✅ Normalize by number of active elements × classes
-                            active_elems = mask.sum() * class_channels + 1e-6
-                            loss_ = (bce * mask).sum() / active_elems
-                        else:
-                            loss_ = F.binary_cross_entropy_with_logits(s_logits, t_probs, reduction='mean')
+                    #         # ✅ Normalize by number of active elements × classes
+                    #         active_elems = mask.sum() * class_channels + 1e-6
+                    #         loss_ = (bce * mask).sum() / active_elems
+                    #     else:
+                    #         loss_ = F.binary_cross_entropy_with_logits(s_logits, t_probs, reduction='mean')
 
-                        # Weighted accumulation across scales
-                        distill_cls_loss += per_scale_weights[i] * loss_
+                    #     # Weighted accumulation across scales
+                    #     distill_cls_loss += per_scale_weights[i] * loss_
 
-                    # --- Combine total losses ---
-                    self.loss = loss.sum()  # original YOLO loss
-                    self.loss += alpha * distill_cls_loss  # add normalized distillation loss
+                    # # --- Combine total losses ---
+                    # self.loss = loss.sum()  # original YOLO loss
+                    # self.loss += alpha * distill_cls_loss  # add normalized distillation loss
 
-                    # Optional logging/debug
-                    print(f"Distill loss (normalized): {distill_cls_loss.item():.4f}")
+                    # # Optional logging/debug
+                    # print(f"Distill loss (normalized): {distill_cls_loss.item():.4f}")
 
-                    # distillation ends here
+                    # # distillation ends here
+                    #----- dfl distillation starts here-----
+                    num_classes = 80
+                    reg_max = 16
+                    T = 2
+                    lambda_d = .5
+                    distill_loss = 0
+                    count = 0
+                    for scale_idx in range(len(preds)):
+                        sp = preds[scale_idx]  # [B, Ctot, H, W]
+                        tp = teacher_preds[scale_idx]  # same shape
+                    
+                        B, Ctot, H, W = sp.shape
+                        # Extract only the DFL logits (distribution channels)
+                        sp = sp[:, num_classes:, :, :]  # [B, 4*reg_max, H, W]
+                        tp = tp[:, num_classes:, :, :]  # same
+                        
+                        # Reshape to separate sides and bins: → [B, H, W, 4, reg_max]
+                        sp = sp.view(B, 4, reg_max, H, W).permute(0, 3, 4, 1, 2)
+                        tp = tp.view(B, 4, reg_max, H, W).permute(0, 3, 4, 1, 2)
+
+                        # Flatten to shape [B * H * W * 4, reg_max]
+                        sp = sp.reshape(-1, reg_max)
+                        tp = tp.reshape(-1, reg_max)
+
+                        # Compute teacher soft distribution and student log-soft
+                        sp = torch.log_softmax(sp / T, dim=-1)        # [N_sel, reg_max]
+                        tp = torch.softmax(tp / T, dim=-1)   # [N_sel, reg_max]
+
+                        # KL divergence: KL(pt || ps) with reduction batchmean
+                        # Multiply by T^2 per distillation convention
+                        loss_kl = torch.nn.functional.kl_div(sp, tp, reduction='batchmean') * (T * T)
+
+                        distill_loss += loss_kl
+                        count += 1
+
+                    # average across scales
+                    if count > 0:
+                        distill_loss = distill_loss / count
+
+                    # weight it
+                    distill_loss = lambda_d * distill_loss
+                    print(distill_loss)
+                    self.loss = loss.sum()
+                    self.loss += distill_loss
                     # self.loss = loss.sum()
                     if RANK != -1:
                         self.loss *= world_size

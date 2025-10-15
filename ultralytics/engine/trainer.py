@@ -550,8 +550,8 @@ class BaseTrainer:
 
                     # for i, (s_pred, t_pred) in enumerate(zip(preds, teacher_preds)):
                     #     # --- Extract class logits (first 80 channels) ---
-                    #     s_logits = s_pred[:, :class_channels, :, :]
-                    #     t_logits = t_pred[:, :class_channels, :, :]
+                    #     s_logits = s_pred[:, -class_channels:, :, :]
+                    #     t_logits = t_pred[:, -class_channels:, :, :]
 
                     #     # --- Compute teacher probabilities (sigmoid + temperature smoothing) ---
                     #     with torch.no_grad():
@@ -595,8 +595,8 @@ class BaseTrainer:
                     
                     #     B, Ctot, H, W = sp.shape
                     #     # Extract only the DFL logits (distribution channels)
-                    #     sp = sp[:, num_classes:, :, :]  # [B, 4*reg_max, H, W]
-                    #     tp = tp[:, num_classes:, :, :]  # same
+                    #     sp = sp[:, :4*reg_max:, :, :]  # [B, 4*reg_max, H, W]
+                    #     tp = tp[:, :4*reg_max:, :, :]  # same
                         
                     #     # Reshape to separate sides and bins: → [B, H, W, 4, reg_max]
                     #     sp = sp.view(B, 4, reg_max, H, W).permute(0, 3, 4, 1, 2)
@@ -640,8 +640,8 @@ class BaseTrainer:
                         tp = teacher_preds[scale_idx]  # same shape
                     
                         B, Ctot, H, W = sp.shape
-                        sp = sp[:, num_classes:, :, :]  # [B, 4*reg_max, H, W]
-                        tp = tp[:, num_classes:, :, :]  # [B, 4*reg_max, H, W]
+                        sp = sp[:, :4*reg_max:, :, :]  # [B, 4*reg_max, H, W]
+                        tp = tp[:, :4*reg_max:, :, :]  # same
 
                         # reshape to separate 4 sides and bins → [B, H, W, 4, reg_max]
                         sp = sp.view(B, 4, reg_max, H, W).permute(0, 3, 4, 1, 2)

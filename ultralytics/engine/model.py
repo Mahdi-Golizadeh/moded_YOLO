@@ -398,37 +398,6 @@ class Model(torch.nn.Module):
         self._check_is_pytorch_model()
         self.model.fuse()
 
-    def embed(
-        self,
-        source: Union[str, Path, int, list, tuple, np.ndarray, torch.Tensor] = None,
-        stream: bool = False,
-        **kwargs: Any,
-    ) -> list:
-        """
-        Generate image embeddings based on the provided source.
-
-        This method is a wrapper around the 'predict()' method, focusing on generating embeddings from an image
-        source. It allows customization of the embedding process through various keyword arguments.
-
-        Args:
-            source (str | Path | int | List | Tuple | np.ndarray | torch.Tensor): The source of the image for
-                generating embeddings. Can be a file path, URL, PIL image, numpy array, etc.
-            stream (bool): If True, predictions are streamed.
-            **kwargs (Any): Additional keyword arguments for configuring the embedding process.
-
-        Returns:
-            (List[torch.Tensor]): A list containing the image embeddings.
-
-        Examples:
-            >>> model = YOLO("yolo11n.pt")
-            >>> image = "https://ultralytics.com/images/bus.jpg"
-            >>> embeddings = model.embed(image)
-            >>> print(embeddings[0].shape)
-        """
-        if not kwargs.get("embed"):
-            kwargs["embed"] = [len(self.model.model) - 2]  # embed second-to-last layer if no indices passed
-        return self.predict(source, stream, **kwargs)
-
     def predict(
         self,
         source: Union[str, Path, int, Image.Image, list, tuple, np.ndarray, torch.Tensor] = None,
@@ -489,50 +458,6 @@ class Model(torch.nn.Module):
         if prompts and hasattr(self.predictor, "set_prompts"):  # for SAM-type models
             self.predictor.set_prompts(prompts)
         return self.predictor.predict_cli(source=source) if is_cli else self.predictor(source=source, stream=stream)
-
-    def track(
-        self,
-        source: Union[str, Path, int, list, tuple, np.ndarray, torch.Tensor] = None,
-        stream: bool = False,
-        persist: bool = False,
-        **kwargs: Any,
-    ) -> List[Results]:
-        """
-        Conduct object tracking on the specified input source using the registered trackers.
-
-        This method performs object tracking using the model's predictors and optionally registered trackers. It handles
-        various input sources such as file paths or video streams, and supports customization through keyword arguments.
-        The method registers trackers if not already present and can persist them between calls.
-
-        Args:
-            source (str | Path | int | List | Tuple | np.ndarray | torch.Tensor, optional): Input source for object
-                tracking. Can be a file path, URL, or video stream.
-            stream (bool): If True, treats the input source as a continuous video stream.
-            persist (bool): If True, persists trackers between different calls to this method.
-            **kwargs (Any): Additional keyword arguments for configuring the tracking process.
-
-        Returns:
-            (List[ultralytics.engine.results.Results]): A list of tracking results, each a Results object.
-
-        Examples:
-            >>> model = YOLO("yolo11n.pt")
-            >>> results = model.track(source="path/to/video.mp4", show=True)
-            >>> for r in results:
-            ...     print(r.boxes.id)  # print tracking IDs
-
-        Notes:
-            - This method sets a default confidence threshold of 0.1 for ByteTrack-based tracking.
-            - The tracking mode is explicitly set in the keyword arguments.
-            - Batch size is set to 1 for tracking in videos.
-        """
-        if not hasattr(self.predictor, "trackers"):
-            from ultralytics.trackers import register_tracker
-
-            register_tracker(self, persist)
-        kwargs["conf"] = kwargs.get("conf") or 0.1  # ByteTrack-based method needs low confidence predictions as input
-        kwargs["batch"] = kwargs.get("batch") or 1  # batch-size 1 for tracking in videos
-        kwargs["mode"] = "track"
-        return self.predict(source=source, stream=stream, **kwargs)
 
     def val(
         self,

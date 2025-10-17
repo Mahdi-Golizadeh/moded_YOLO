@@ -121,37 +121,9 @@ class Model(torch.nn.Module):
         self.ckpt_path = None
         self.overrides = {}  # overrides for trainer object
         self.metrics = None  # validation/training metrics
-        self.session = None  # HUB session
         self.task = task  # task type
         self.model_name = None  # model name
         model = str(model).strip()
-
-        # Check if Ultralytics HUB model from https://hub.ultralytics.com
-        if self.is_hub_model(model):
-            from ultralytics.hub import HUBTrainingSession
-
-            # Fetch model from HUB
-            checks.check_requirements("hub-sdk>=0.0.12")
-            session = HUBTrainingSession.create_session(model)
-            model = session.model_file
-            if session.train_args:  # training sent from HUB
-                self.session = session
-
-        # Check if Triton Server model
-        elif self.is_triton_model(model):
-            self.model_name = self.model = model
-            self.overrides["task"] = task or "detect"  # set `task=detect` if not explicitly set
-            return
-
-        # Load or create new YOLO model
-        __import__("os").environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"  # to avoid deterministic warnings
-        if str(model).endswith((".yaml", ".yml")):
-            self._new(model, task=task, verbose=verbose)
-        else:
-            self._load(model, task=task)
-
-        # Delete super().training for accessing self.model.training
-        del self.training
 
     def __call__(
         self,
@@ -183,55 +155,6 @@ class Model(torch.nn.Module):
             ...     print(f"Detected {len(r)} objects in image")
         """
         return self.predict(source, stream, **kwargs)
-
-    @staticmethod
-    def is_triton_model(model: str) -> bool:
-        """
-        Check if the given model string is a Triton Server URL.
-
-        This static method determines whether the provided model string represents a valid Triton Server URL by
-        parsing its components using urllib.parse.urlsplit().
-
-        Args:
-            model (str): The model string to be checked.
-
-        Returns:
-            (bool): True if the model string is a valid Triton Server URL, False otherwise.
-
-        Examples:
-            >>> Model.is_triton_model("http://localhost:8000/v2/models/yolo11n")
-            True
-            >>> Model.is_triton_model("yolo11n.pt")
-            False
-        """
-        from urllib.parse import urlsplit
-
-        url = urlsplit(model)
-        return url.netloc and url.path and url.scheme in {"http", "grpc"}
-
-    @staticmethod
-    def is_hub_model(model: str) -> bool:
-        """
-        Check if the provided model is an Ultralytics HUB model.
-
-        This static method determines whether the given model string represents a valid Ultralytics HUB model
-        identifier.
-
-        Args:
-            model (str): The model string to check.
-
-        Returns:
-            (bool): True if the model is a valid Ultralytics HUB model, False otherwise.
-
-        Examples:
-            >>> Model.is_hub_model("https://hub.ultralytics.com/models/MODEL")
-            True
-            >>> Model.is_hub_model("yolo11n.pt")
-            False
-        """
-        from ultralytics.hub import HUB_WEB_ROOT
-
-        return model.startswith(f"{HUB_WEB_ROOT}/models/")
 
     def _new(self, cfg: str, task=None, model=None, verbose=False) -> None:
         """
@@ -770,10 +693,6 @@ class Model(torch.nn.Module):
             >>> results = model.train(data="coco8.yaml", epochs=3)
         """
         self._check_is_pytorch_model()
-        if hasattr(self.session, "model") and self.session.model.id:  # Ultralytics HUB session with loaded model
-            if any(kwargs):
-                LOGGER.warning("using HUB training arguments, ignoring local training arguments.")
-            kwargs = self.session.train_args  # overwrite kwargs
 
         checks.check_pip_update_available()
 
@@ -795,7 +714,6 @@ class Model(torch.nn.Module):
             self.trainer.model = self.trainer.get_model(weights=self.model if self.ckpt else None, cfg=self.model.yaml)
             self.model = self.trainer.model
 
-        self.trainer.hub_session = self.session  # attach optional HUB session
         self.trainer.train()
         # Update model and cfg after training
         if RANK in {-1, 0}:

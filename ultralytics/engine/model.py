@@ -124,7 +124,16 @@ class Model(torch.nn.Module):
         self.task = task  # task type
         self.model_name = None  # model name
         model = str(model).strip()
+        # Load or create new YOLO model
+        __import__("os").environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"  # to avoid deterministic warnings
+        if str(model).endswith((".yaml", ".yml")):
+            self._new(model, task=task, verbose=verbose)
+        else:
+            self._load(model, task=task)
 
+        # Delete super().training for accessing self.model.training
+        del self.training
+        
     def __call__(
         self,
         source: Union[str, Path, int, Image.Image, list, tuple, np.ndarray, torch.Tensor] = None,

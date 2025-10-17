@@ -8,6 +8,9 @@ import numpy as np
 import torch
 from PIL import Image
 
+from ultralytics.models.yolo.detect.predict import DetectionPredictor
+from ultralytics.models.yolo.detect.train import DetectionTrainer
+from ultralytics.models.yolo.detect.val import DetectionValidator
 from ultralytics.nn.tasks import DetectionModel
 from ultralytics.cfg import TASK2DATA, get_cfg, get_save_dir
 from ultralytics.engine.results import Results
@@ -190,7 +193,7 @@ class Model(torch.nn.Module):
         """
         cfg_dict = yaml_model_load(cfg)
         self.cfg = cfg
-        self.task = task or guess_model_task(cfg_dict)
+        self.task = "detect"
         self.model = DetectionModel(cfg_dict, verbose=verbose and RANK == -1)  # build model
         self.overrides["model"] = self.cfg
         self.overrides["task"] = self.task
@@ -477,7 +480,7 @@ class Model(torch.nn.Module):
         prompts = args.pop("prompts", None)  # for SAM-type models
 
         if not self.predictor:
-            self.predictor = (predictor or self._smart_load("predictor"))(overrides=args, _callbacks=self.callbacks)
+            self.predictor = DetectionPredictor(overrides=args, _callbacks=self.callbacks)
             self.predictor.setup_model(model=self.model, verbose=is_cli)
         else:  # only update args if predictor is already setup
             self.predictor.args = get_cfg(self.predictor.args, args)
@@ -562,7 +565,7 @@ class Model(torch.nn.Module):
         custom = {"rect": True}  # method defaults
         args = {**self.overrides, **custom, **kwargs, "mode": "val"}  # highest priority args on the right
 
-        validator = (validator or self._smart_load("validator"))(args=args, _callbacks=self.callbacks)
+        validator = DetectionValidator(args=args, _callbacks=self.callbacks)
         validator(model=self.model)
         self.metrics = validator.metrics
         return validator.metrics
@@ -719,7 +722,7 @@ class Model(torch.nn.Module):
         if args.get("resume"):
             args["resume"] = self.ckpt_path
 
-        self.trainer = (trainer or self._smart_load("trainer"))(overrides=args, _callbacks=self.callbacks)
+        self.trainer = DetectionTrainer(overrides=args, _callbacks=self.callbacks)
         if not args.get("resume"):  # manually set model only if not resuming
             self.trainer.model = self.trainer.get_model(weights=self.model if self.ckpt else None, cfg=self.model.yaml)
             self.model = self.trainer.model
@@ -986,66 +989,6 @@ class Model(torch.nn.Module):
         """
         include = {"imgsz", "data", "task", "single_cls"}  # only remember these arguments when loading a PyTorch model
         return {k: v for k, v in args.items() if k in include}
-
-    # def __getattr__(self, attr):
-    #    """Raises error if object has no requested attribute."""
-    #    name = self.__class__.__name__
-    #    raise AttributeError(f"'{name}' object has no attribute '{attr}'. See valid attributes below.\n{self.__doc__}")
-
-    def _smart_load(self, key: str):
-        """
-        Intelligently load the appropriate module based on the model task.
-
-        This method dynamically selects and returns the correct module (model, trainer, validator, or predictor)
-        based on the current task of the model and the provided key. It uses the task_map dictionary to determine
-        the appropriate module to load for the specific task.
-
-        Args:
-            key (str): The type of module to load. Must be one of 'model', 'trainer', 'validator', or 'predictor'.
-
-        Returns:
-            (object): The loaded module class corresponding to the specified key and current task.
-
-        Raises:
-            NotImplementedError: If the specified key is not supported for the current task.
-
-        Examples:
-            >>> model = Model(task="detect")
-            >>> predictor_class = model._smart_load("predictor")
-            >>> trainer_class = model._smart_load("trainer")
-        """
-        try:
-            return self.task_map[self.task][key]
-        except Exception as e:
-            name = self.__class__.__name__
-            mode = inspect.stack()[1][3]  # get the function name.
-            raise NotImplementedError(f"'{name}' model does not support '{mode}' mode for '{self.task}' task.") from e
-
-    @property
-    def task_map(self) -> dict:
-        """
-        Provide a mapping from model tasks to corresponding classes for different modes.
-
-        This property method returns a dictionary that maps each supported task (e.g., detect, segment, classify)
-        to a nested dictionary. The nested dictionary contains mappings for different operational modes
-        (model, trainer, validator, predictor) to their respective class implementations.
-
-        The mapping allows for dynamic loading of appropriate classes based on the model's task and the
-        desired operational mode. This facilitates a flexible and extensible architecture for handling
-        various tasks and modes within the Ultralytics framework.
-
-        Returns:
-            (Dict[str, Dict[str, Any]]): A dictionary mapping task names to nested dictionaries. Each nested dictionary
-            contains mappings for 'model', 'trainer', 'validator', and 'predictor' keys to their respective class
-            implementations for that task.
-
-        Examples:
-            >>> model = Model("yolo11n.pt")
-            >>> task_map = model.task_map
-            >>> detect_predictor = task_map["detect"]["predictor"]
-            >>> segment_trainer = task_map["segment"]["trainer"]
-        """
-        raise NotImplementedError("Please provide task map for your model!")
 
     def eval(self):
         """

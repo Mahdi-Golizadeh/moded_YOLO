@@ -533,9 +533,13 @@ class BaseTrainer:
                         t1 = self.teacher(batch)
 
                     # Standard YOLO loss & predictions
-                    loss, self.loss_items = testing[0]
+                    loss, self.loss_items, st_mask = testing[0]
+                    print(f"st_mask {st_mask.sum().item()}")
                     self.loss = loss.sum()
                     preds = testing[1]
+                    tch_mask = t1[0][-1]
+                    print(f"t_mask {tch_mask.sum().item()}")
+                    torch.save(tch_mask, "mask_1.pt")
                     teacher_preds = t1[1]
                     if kls_dist == True:
                         # --- class Distillation setup ---

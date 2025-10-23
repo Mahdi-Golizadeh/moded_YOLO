@@ -531,16 +531,30 @@ class BaseTrainer:
                     testing = self.model(batch)
                     with torch.no_grad():
                         t1 = self.teacher(batch)
+                    teacher_preds = t1[1]
+                    # creating mask based on pure teacher's output
+                    teacher_fg_masks = []
+                    num_classes = 80
+                    dfl_channels = 4 * 16
+                    conf_thresh = .5
+                    for pred in teacher_preds:
+                        # pred shape: [B, 144, H, W] = [B, 64 (DFL) + 80 (CLS), H, W]
+                        cls_pred = pred[:, dfl_channels:, :, :]  # Take last 80 channels
 
+                        # Compute max class confidence (after sigmoid)
+                        cls_conf = cls_pred.sigmoid().max(dim=1)[0]  # [B, H, W]
+
+                        # Foreground mask
+                        fg_mask = cls_conf > conf_thresh  # [B, H, W]
+                        teacher_fg_masks.append(fg_mask)
+                    torch.save(teacher_fg_masks, "fg_masks_batch4.pt")
+                    # end of creating mask
                     # Standard YOLO loss & predictions
                     loss, self.loss_items, st_mask = testing[0]
-                    print(f"st_mask {st_mask.sum().item()}")
                     self.loss = loss.sum()
                     preds = testing[1]
-                    tch_mask = t1[0][-1]
-                    print(f"t_mask {tch_mask.sum().item()}")
-                    torch.save(tch_mask, "mask_1.pt")
-                    teacher_preds = t1[1]
+                    # teacher_preds = t1[1]
+                    print(len(teacher_preds), teacher_preds[0].shape, teacher_preds[1].shape, teacher_preds[2].shape)
                     if kls_dist == True:
                         # --- class Distillation setup ---
                         class_channels = 80

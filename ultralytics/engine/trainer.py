@@ -600,50 +600,66 @@ class BaseTrainer:
                         # --- class Distillation setup ---
                         class_channels = 80
                         per_scale_weights = [
-                                                1.5 - 0.5 * progress,  # small objects
-                                                1.0,                   # medium
-                                                0.5 + 0.5 * progress,  # large objects
-                                            ]
-                        teacher_conf_thresh = 0.5 - 0.3 * min(1.0, progress * 1.5)  # only distill confident teacher regions
-                        alpha = 0.01 + 0.09 * min(1.0, progress * 2.0)  # saturates at 0.1 halfway through                # scale factor for KD term
-                        T = 3.0 - 1.5 * min(1.0, progress * 1.5)                     # optional temperature
+                            1.5 - 0.5 * progress,  # small objects
+                            1.0,                   # medium
+                            0.5 + 0.5 * progress,  # large objects
+                        ]
+                        teacher_conf_thresh = 0.5 - 0.3 * min(1.0, progress * 1.5)
+                        alpha = 0.01 + 0.09 * min(1.0, progress * 2.0)
+                        T = 3.0 - 1.5 * min(1.0, progress * 1.5)
+
+                        # >>> NEW: Toggle mask usage <<<
+                        use_fg_mask = True  # Set to False to disable spatial foreground mask
 
                         distill_cls_loss = 0.0
 
                         for i, (s_pred, t_pred) in enumerate(zip(preds, teacher_preds)):
-                            # --- Extract class logits (first 80 channels) ---
-                            s_logits = s_pred[:, -class_channels:, :, :]
-                            t_logits = t_pred[:, -class_channels:, :, :]
+                            # --- Extract class logits ---
+                            s_logits = s_pred[:, -class_channels:, :, :]  # [B, 80, H, W]
+                            t_logits = t_pred[:, -class_channels:, :, :]  # [B, 80, H, W]
 
-                            # --- Compute teacher probabilities (sigmoid + temperature smoothing) ---
+                            # --- Teacher probabilities with temperature ---
                             with torch.no_grad():
-                                t_probs = torch.sigmoid(t_logits / T)
+                                t_probs = torch.sigmoid(t_logits / T)  # [B, 80, H, W]
 
-                            # --- Optional confidence mask ---
+                            # --- Start building combined mask ---
+                            combined_mask = None
+
+                            # 1. Confidence-based mask (original)
                             if teacher_conf_thresh > 0.0:
-                                t_max, _ = t_probs.max(dim=1, keepdim=True)
-                                mask = (t_max >= teacher_conf_thresh).float()
+                                t_max, _ = t_probs.max(dim=1, keepdim=True)  # [B, 1, H, W]
+                                conf_mask = (t_max >= teacher_conf_thresh).float()  # [B, 1, H, W]
+                                combined_mask = conf_mask
 
-                                # Binary cross-entropy between logits and teacher probs
-                                bce = F.binary_cross_entropy_with_logits(s_logits, t_probs, reduction='none')
+                            # 2. Spatial foreground mask (from your earlier generation)
+                            if use_fg_mask:
+                                # Assume `teacher_fg_masks` is already computed and available in scope
+                                fg_mask = teacher_fg_masks[i].float().unsqueeze(1)  # [B, 1, H, W]
+                                if combined_mask is not None:
+                                    combined_mask = combined_mask * fg_mask  # logical AND (both must be true)
+                                else:
+                                    combined_mask = fg_mask
 
-                                # ✅ Normalize by number of active elements × classes
-                                active_elems = mask.sum() * class_channels + 1e-6
-                                loss_ = (bce * mask).sum() / active_elems
+                            # --- Compute distillation loss ---
+                            bce = F.binary_cross_entropy_with_logits(s_logits, t_probs, reduction='none')  # [B, 80, H, W]
+
+                            if combined_mask is not None:
+                                # Apply mask: broadcast over 80 classes
+                                masked_bce = bce * combined_mask  # [B, 80, H, W]
+                                active_elems = combined_mask.sum() * class_channels + 1e-6
+                                loss_ = masked_bce.sum() / active_elems
                             else:
-                                loss_ = F.binary_cross_entropy_with_logits(s_logits, t_probs, reduction='mean')
+                                loss_ = bce.mean()
 
-                            # Weighted accumulation across scales
+                            # Weighted accumulation
                             distill_cls_loss += per_scale_weights[i] * loss_
 
-                        # --- Combine total losses ---
-                        # self.loss = loss.sum()  # original YOLO loss
-                        self.loss += alpha * distill_cls_loss  # add normalized distillation loss
+                        # --- Final loss combination ---
+                        self.loss += alpha * distill_cls_loss
 
-                        # Optional logging/debug
+                        # Optional logging
                         print(f"kls Distillation loss (normalized): {distill_cls_loss.item():.4f}")
-
-                        # kls distillation ends here
+                        # end of cls distillation
                     if dfl_dist == True:
                         #----- dfl distillation starts here-----
                         num_classes = 80

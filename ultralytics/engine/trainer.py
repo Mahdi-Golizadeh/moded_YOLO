@@ -519,13 +519,17 @@ class BaseTrainer:
                         )
                         if "momentum" in x:
                             x["momentum"] = np.interp(ni, xi, [self.args.warmup_momentum, self.args.momentum])
-                kls_dist = True
-                dfl_dist = True
-                l2_dist = True
+                kls_dist = False
+                dfl_dist = False
+                l2_dist = False
                 # Forward
+                import pickle
                 with autocast(self.amp):
                     batch = self.preprocess_batch(batch)
-            
+                    # print(type(batch))
+                    # Save to file
+                    with open('my_dict.pkl', 'wb') as f:
+                        pickle.dump(batch, f)
                     progress = (epoch + 1) / self.args.epochs
                     # Forward pass through student and teacher
                     student_out = self.model(batch)
@@ -536,7 +540,7 @@ class BaseTrainer:
                     teacher_fg_masks = []
                     num_classes = 80
                     dfl_channels = 4 * 16
-                    conf_thresh = .5
+                    conf_thresh = .25
                     for pred in teacher_preds:
                         # pred shape: [B, 144, H, W] = [B, 64 (DFL) + 80 (CLS), H, W]
                         cls_pred = pred[:, dfl_channels:, :, :]  # Take last 80 channels

@@ -528,10 +528,10 @@ class BaseTrainer:
             
                     progress = (epoch + 1) / self.args.epochs
                     # Forward pass through student and teacher
-                    testing = self.model(batch)
+                    student_out = self.model(batch)
                     with torch.no_grad():
-                        t1 = self.teacher(batch)
-                    teacher_preds = t1[1]
+                        teacher_out = self.teacher(batch)
+                    teacher_preds = teacher_out[1]
                     # creating mask based on pure teacher's output
                     teacher_fg_masks = []
                     num_classes = 80
@@ -550,9 +550,9 @@ class BaseTrainer:
                     torch.save(teacher_fg_masks, "fg_masks_batch4.pt")
                     # end of creating mask
                     # Standard YOLO loss & predictions
-                    loss, self.loss_items, st_mask = testing[0]
+                    loss, self.loss_items, st_mask = student_out[0]
                     self.loss = loss.sum()
-                    preds = testing[1]
+                    preds = student_out[1]
                     # teacher_preds = t1[1]
                     print(len(teacher_preds), teacher_preds[0].shape, teacher_preds[1].shape, teacher_preds[2].shape)
                     if kls_dist == True:

@@ -537,19 +537,56 @@ class BaseTrainer:
                         teacher_out = self.teacher(batch)
                     teacher_preds = teacher_out[1]
                     # creating mask based on pure teacher's output
-                    teacher_fg_masks = []
-                    num_classes = 80
-                    dfl_channels = 4 * 16
-                    conf_thresh = .25
-                    for pred in teacher_preds:
-                        # pred shape: [B, 144, H, W] = [B, 64 (DFL) + 80 (CLS), H, W]
-                        cls_pred = pred[:, dfl_channels:, :, :]  # Take last 80 channels
+                    # ===== CONFIGURABLE OPTIONS =====
+                    use_topk = True          # Set True to use top-k adaptive thresholding (Option 2)
+                    topk_ratio = 0.2          # Keep top 20% of locations per image (only used if use_topk=True)
 
-                        # Compute max class confidence (after sigmoid)
+                    use_dfl_objectness = True  # Set True to modulate by DFL entropy (Option 4)
+
+                    # ===== FIXED HYPERPARAMETERS =====
+                    num_classes = 80
+                    reg_max = 16
+                    dfl_channels = 4 * reg_max
+                    base_conf_thresh = 0.25   # Only used if use_topk=False
+                    eps = 1e-8
+                    max_ent = math.log(reg_max)  # ~2.7726 for reg_max=16
+
+                    # ===== GENERATE MASKS =====
+                    teacher_fg_masks = []
+                    for pred in teacher_preds:
+                        B, C, H, W = pred.shape
+                        assert C == dfl_channels + num_classes, f"Channel mismatch: expected {dfl_channels + num_classes}, got {C}"
+
+                        # --- 1. Classification confidence ---
+                        cls_pred = pred[:, dfl_channels:, :, :]  # [B, 80, H, W]
                         cls_conf = cls_pred.sigmoid().max(dim=1)[0]  # [B, H, W]
 
-                        # Foreground mask
-                        fg_mask = cls_conf > conf_thresh  # [B, H, W]
+                        # --- 2. (Optional) DFL-based objectness weighting ---
+                        if use_dfl_objectness:
+                            dfl_pred = pred[:, :dfl_channels, :, :]  # [B, 64, H, W]
+                            dfl_probs = dfl_pred.view(B, 4, reg_max, H, W).softmax(dim=2)  # [B, 4, 16, H, W]
+                            entropy = -(dfl_probs * torch.log(dfl_probs + eps)).sum(dim=2)  # [B, 4, H, W]
+                            mean_entropy = entropy.mean(dim=1)  # [B, H, W]
+                            norm_entropy = torch.clamp(mean_entropy / max_ent, 0.0, 1.0)
+                            objectness_dfl = 1.0 - norm_entropy  # [B, H, W]
+                            joint_conf = cls_conf * objectness_dfl
+                        else:
+                            joint_conf = cls_conf
+
+                        # --- 3. Thresholding: fixed vs top-k ---
+                        if use_topk:
+                            # Flatten spatial dimensions: [B, H*W]
+                            conf_flat = joint_conf.view(B, -1)
+                            num_keep = max(1, int(topk_ratio * H * W))
+                            # Get the k-th largest value per image (threshold)
+                            topk_vals, _ = torch.topk(conf_flat, num_keep, dim=1, sorted=False)
+                            thresh = topk_vals.min(dim=1, keepdim=True)[0]  # [B, 1]
+                            # Broadcast threshold to [B, H, W]
+                            thresh = thresh.view(B, 1, 1).expand(-1, H, W)
+                            fg_mask = joint_conf >= thresh
+                        else:
+                            fg_mask = joint_conf > base_conf_thresh
+
                         teacher_fg_masks.append(fg_mask)
                     torch.save(teacher_fg_masks, "fg_masks_batch4.pt")
                     # end of creating mask

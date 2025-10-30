@@ -519,9 +519,9 @@ class BaseTrainer:
                         )
                         if "momentum" in x:
                             x["momentum"] = np.interp(ni, xi, [self.args.warmup_momentum, self.args.momentum])
-                kls_dist = False
-                dfl_dist = False
-                l2_dist = False
+                kls_dist = True
+                dfl_dist = True
+                l2_dist = True
                 # Forward
                 import pickle
                 with autocast(self.amp):
@@ -661,98 +661,137 @@ class BaseTrainer:
                         print(f"kls Distillation loss (normalized): {distill_cls_loss.item():.4f}")
                         # end of cls distillation
                     if dfl_dist == True:
-                        #----- dfl distillation starts here-----
+                        # ----- DFL distillation starts here -----
                         num_classes = 80
                         reg_max = 16
-                        T = 2
-                        lambda_d = .5
-                        distill_loss = 0
+                        T = 2.0
+                        lambda_d = 0.5
+
+                        # >>> NEW: Toggle mask usage <<<
+                        use_fg_mask = True  # Set to False to disable spatial masking
+
+                        distill_loss = 0.0
                         count = 0
+
                         for scale_idx in range(len(preds)):
-                            sp = preds[scale_idx]  # [B, Ctot, H, W]
-                            tp = teacher_preds[scale_idx]  # same shape
-                        
+                            sp = preds[scale_idx]      # [B, Ctot, H, W]
+                            tp = teacher_preds[scale_idx]
+
                             B, Ctot, H, W = sp.shape
-                            # Extract only the DFL logits (distribution channels)
-                            sp = sp[:, :4*reg_max:, :, :]  # [B, 4*reg_max, H, W]
-                            tp = tp[:, :4*reg_max:, :, :]  # same
-                            
-                            # Reshape to separate sides and bins: → [B, H, W, 4, reg_max]
-                            sp = sp.view(B, 4, reg_max, H, W).permute(0, 3, 4, 1, 2)
-                            tp = tp.view(B, 4, reg_max, H, W).permute(0, 3, 4, 1, 2)
+                            dfl_channels = 4 * reg_max
 
-                            # Flatten to shape [B * H * W * 4, reg_max]
-                            sp = sp.reshape(-1, reg_max)
-                            tp = tp.reshape(-1, reg_max)
+                            # Extract DFL logits (first 64 channels)
+                            sp_dfl = sp[:, :dfl_channels, :, :]   # [B, 64, H, W]
+                            tp_dfl = tp[:, :dfl_channels, :, :]   # [B, 64, H, W]
 
-                            # Compute teacher soft distribution and student log-soft
-                            sp = torch.log_softmax(sp / T, dim=-1)        # [N_sel, reg_max]
-                            tp = torch.softmax(tp / T, dim=-1)   # [N_sel, reg_max]
+                            # Reshape to [B, 4, reg_max, H, W]
+                            sp_reshaped = sp_dfl.view(B, 4, reg_max, H, W)
+                            tp_reshaped = tp_dfl.view(B, 4, reg_max, H, W)
 
-                            # KL divergence: KL(pt || ps) with reduction batchmean
-                            # Multiply by T^2 per distillation convention
-                            loss_kl = torch.nn.functional.kl_div(sp, tp, reduction='batchmean') * (T * T)
+                            # Compute KL divergence per location and coordinate
+                            with torch.no_grad():
+                                tp_soft = torch.softmax(tp_reshaped / T, dim=2)  # [B, 4, reg_max, H, W]
+                            sp_logsoft = torch.log_softmax(sp_reshaped / T, dim=2)  # [B, 4, reg_max, H, W]
+
+                            # KL divergence: [B, 4, H, W] (sum over reg_max)
+                            kl_per_pixel = torch.sum(tp_soft * (torch.log(tp_soft + 1e-8) - sp_logsoft), dim=2)  # [B, 4, H, W]
+
+                            # Reduce over the 4 coordinates (mean or sum)
+                            kl_spatial = kl_per_pixel.mean(dim=1)  # [B, H, W]  (you can also use .sum(dim=1))
+
+                            # --- Apply foreground mask if enabled ---
+                            if use_fg_mask:
+                                fg_mask = teacher_fg_masks[scale_idx].float()  # [B, H, W], from your precomputed list
+                                masked_kl = kl_spatial * fg_mask
+                                # Normalize by number of active elements (not just batchmean)
+                                active = fg_mask.sum() + 1e-6
+                                loss_kl = masked_kl.sum() / active
+                            else:
+                                # Original: mean over all pixels and batch
+                                loss_kl = kl_spatial.mean()
+
+                            # Scale by T^2 (standard in distillation)
+                            loss_kl = loss_kl * (T ** 2)
 
                             distill_loss += loss_kl
                             count += 1
 
-                        # average across scales
+                        # Average across scales
                         if count > 0:
                             distill_loss = distill_loss / count
 
-                        # weight it
+                        # Final weight
                         distill_loss = lambda_d * distill_loss
-                        print(f"fdl_distill is: {distill_loss}")
-                        # self.loss = loss.sum()
+                        print(f"dfl_distill is: {distill_loss.item():.6f}")
+
+                        # Add to total loss
                         self.loss += distill_loss
                         # dfl distillation ends here
                     if l2_dist == True:
-                    # regression distillation starts here
+                        # ----- L2 box regression distillation starts here -----
                         num_classes = 80
                         reg_max = 16
-                        λ_box_reg = 1.0  # weighting for box regression loss
+                        λ_box_reg = 1.0
 
-                        box_reg_loss = 0
+                        # >>> NEW: Toggle mask usage <<<
+                        use_fg_mask = True  # Set to False to disable spatial masking
+
+                        box_reg_loss = 0.0
                         count = 0
 
+                        # Precompute bins once (shape: [1, reg_max])
+                        bins = torch.arange(reg_max, device=self.device, dtype=torch.float32).unsqueeze(0)  # [1, reg_max]
+
                         for scale_idx in range(len(preds)):
-                            sp = preds[scale_idx]  # [B, Ctot, H, W]
-                            tp = teacher_preds[scale_idx]  # same shape
-                        
+                            sp = preds[scale_idx]      # [B, Ctot, H, W]
+                            tp = teacher_preds[scale_idx]
+
                             B, Ctot, H, W = sp.shape
-                            sp = sp[:, :4*reg_max:, :, :]  # [B, 4*reg_max, H, W]
-                            tp = tp[:, :4*reg_max:, :, :]  # same
+                            dfl_channels = 4 * reg_max
 
-                            # reshape to separate 4 sides and bins → [B, H, W, 4, reg_max]
-                            sp = sp.view(B, 4, reg_max, H, W).permute(0, 3, 4, 1, 2)
-                            tp = tp.view(B, 4, reg_max, H, W).permute(0, 3, 4, 1, 2)
+                            # Extract DFL logits (first 64 channels)
+                            sp_dfl = sp[:, :dfl_channels, :, :]   # [B, 64, H, W]
+                            tp_dfl = tp[:, :dfl_channels, :, :]   # [B, 64, H, W]
 
-                            # flatten for convenience
-                            sp = sp.reshape(-1, reg_max)  # [B*H*W*4, reg_max]
-                            tp = tp.reshape(-1, reg_max)
+                            # Reshape to [B, 4, reg_max, H, W]
+                            sp_reshaped = sp_dfl.view(B, 4, reg_max, H, W)
+                            tp_reshaped = tp_dfl.view(B, 4, reg_max, H, W)
 
-                            # convert logits → probabilities
-                            sp = torch.softmax(sp, dim=-1)
-                            tp = torch.softmax(tp, dim=-1)
+                            # Convert to probabilities
+                            sp_prob = torch.softmax(sp_reshaped, dim=2)  # [B, 4, reg_max, H, W]
+                            tp_prob = torch.softmax(tp_reshaped, dim=2)  # [B, 4, reg_max, H, W]
 
-                            # compute expected continuous offsets for each side
-                            bins = torch.arange(reg_max, device=self.device,).unsqueeze(0)  # [1, reg_max]
-                            sp = torch.sum(sp * bins, dim=-1)  # [N_sel]
-                            tp = torch.sum(tp * bins, dim=-1)  # [N_sel]
+                            # Compute expected values (continuous offsets)
+                            # bins: [1, reg_max] → broadcast over B,4,H,W
+                            sp_val = torch.sum(sp_prob * bins, dim=2)  # [B, 4, H, W]
+                            tp_val = torch.sum(tp_prob * bins, dim=2)  # [B, 4, H, W]
 
-                            # L2 (mean squared error) between offsets
-                            loss_reg = F.mse_loss(sp, tp, reduction='mean')
+                            # Compute squared error per coordinate → [B, 4, H, W]
+                            sq_error = (sp_val - tp_val) ** 2
+
+                            # Reduce over the 4 box sides (mean or sum); we use mean
+                            l2_spatial = sq_error.mean(dim=1)  # [B, H, W]
+
+                            # --- Apply foreground mask if enabled ---
+                            if use_fg_mask:
+                                fg_mask = teacher_fg_masks[scale_idx].float()  # [B, H, W]
+                                masked_l2 = l2_spatial * fg_mask
+                                active = fg_mask.sum() + 1e-6
+                                loss_reg = masked_l2.sum() / active
+                            else:
+                                loss_reg = l2_spatial.mean()
 
                             box_reg_loss += loss_reg
                             count += 1
 
+                        # Average across scales
                         if count > 0:
                             box_reg_loss = box_reg_loss / count
 
+                        # Apply final weight
                         box_reg_loss = λ_box_reg * box_reg_loss
 
-                        print("L2 box regression loss:", box_reg_loss.item())
-                        # self.loss = loss.sum()
+                        print(f"L2 box regression loss: {box_reg_loss.item():.6f}")
                         self.loss += box_reg_loss
                         #regression distillation ends here
                     # self.loss = loss.sum()

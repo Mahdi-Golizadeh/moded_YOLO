@@ -540,7 +540,6 @@ class BaseTrainer:
                     # ===== CONFIGURABLE OPTIONS =====
                     use_topk = True          # Set True to use top-k adaptive thresholding (Option 2)
                     topk_ratio = 0.1          # Keep top 20% of locations per image (only used if use_topk=True)
-
                     use_dfl_objectness = True  # Set True to modulate by DFL entropy (Option 4)
 
                     # ===== FIXED HYPERPARAMETERS =====
@@ -588,14 +587,15 @@ class BaseTrainer:
                             fg_mask = joint_conf > base_conf_thresh
 
                         teacher_fg_masks.append(fg_mask)
-                    torch.save(teacher_fg_masks, "fg_masks_batch4.pt")
+                    
+                    # torch.save(teacher_fg_masks, "fg_masks_batch4.pt")
                     # end of creating mask
                     # Standard YOLO loss & predictions
                     loss, self.loss_items, st_mask = student_out[0]
                     self.loss = loss.sum()
-                    preds = student_out[1]
+                    student_preds = student_out[1]
                     # teacher_preds = t1[1]
-                    print(len(teacher_preds), teacher_preds[0].shape, teacher_preds[1].shape, teacher_preds[2].shape)
+                    
                     if kls_dist == True:
                         # --- class Distillation setup ---
                         class_channels = 80
@@ -604,7 +604,7 @@ class BaseTrainer:
                             1.0,                   # medium
                             0.5 + 0.5 * progress,  # large objects
                         ]
-                        teacher_conf_thresh = 0.5 - 0.3 * min(1.0, progress * 1.5)
+                        
                         alpha = 0.01 + 0.09 * min(1.0, progress * 2.0)
                         T = 3.0 - 1.5 * min(1.0, progress * 1.5)
 
@@ -613,7 +613,7 @@ class BaseTrainer:
 
                         distill_cls_loss = 0.0
 
-                        for i, (s_pred, t_pred) in enumerate(zip(preds, teacher_preds)):
+                        for i, (s_pred, t_pred) in enumerate(zip(student_preds, teacher_preds)):
                             # --- Extract class logits ---
                             s_logits = s_pred[:, -class_channels:, :, :]  # [B, 80, H, W]
                             t_logits = t_pred[:, -class_channels:, :, :]  # [B, 80, H, W]
@@ -624,12 +624,6 @@ class BaseTrainer:
 
                             # --- Start building combined mask ---
                             combined_mask = None
-
-                            # 1. Confidence-based mask (original)
-                            if teacher_conf_thresh > 0.0:
-                                t_max, _ = t_probs.max(dim=1, keepdim=True)  # [B, 1, H, W]
-                                conf_mask = (t_max >= teacher_conf_thresh).float()  # [B, 1, H, W]
-                                combined_mask = conf_mask
 
                             # 2. Spatial foreground mask (from your earlier generation)
                             if use_fg_mask:
@@ -656,7 +650,7 @@ class BaseTrainer:
 
                         # --- Final loss combination ---
                         self.loss += alpha * distill_cls_loss
-
+                        
                         # Optional logging
                         print(f"kls Distillation loss (normalized): {distill_cls_loss.item():.4f}")
                         # end of cls distillation

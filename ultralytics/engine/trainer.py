@@ -539,7 +539,7 @@ class BaseTrainer:
                     # creating mask based on pure teacher's output
                     # ===== CONFIGURABLE OPTIONS =====
                     use_topk = True          # Set True to use top-k adaptive thresholding (Option 2)
-                    topk_ratio = 0.1          # Keep top 20% of locations per image (only used if use_topk=True)
+                    topk_ratio = 0.2          # Keep top 20% of locations per image (only used if use_topk=True)
                     use_dfl_objectness = True  # Set True to modulate by DFL entropy (Option 4)
 
                     # ===== FIXED HYPERPARAMETERS =====
@@ -658,7 +658,7 @@ class BaseTrainer:
                         # ----- DFL distillation starts here -----
                         num_classes = 80
                         reg_max = 16
-                        T = 2.0
+                        T = 3.0 - 1.5 * min(1.0, progress * 1.5)
                         lambda_d = 0.5
 
                         # >>> NEW: Toggle mask usage <<<
@@ -667,8 +667,8 @@ class BaseTrainer:
                         distill_loss = 0.0
                         count = 0
 
-                        for scale_idx in range(len(preds)):
-                            sp = preds[scale_idx]      # [B, Ctot, H, W]
+                        for scale_idx in range(len(student_preds)):
+                            sp = student_preds[scale_idx]      # [B, Ctot, H, W]
                             tp = teacher_preds[scale_idx]
 
                             B, Ctot, H, W = sp.shape
@@ -735,9 +735,9 @@ class BaseTrainer:
 
                         # Precompute bins once (shape: [1, reg_max])
                         bins = torch.arange(reg_max, device=self.device, dtype=torch.float32).view(1, 1, reg_max, 1, 1)  # [1,1,16,1,1]  # [1, reg_max]
-
-                        for scale_idx in range(len(preds)):
-                            sp = preds[scale_idx]      # [B, Ctot, H, W]
+                    
+                        for scale_idx in range(len(student_preds)):
+                            sp = student_preds[scale_idx]      # [B, Ctot, H, W]
                             tp = teacher_preds[scale_idx]
 
                             B, Ctot, H, W = sp.shape
@@ -757,8 +757,10 @@ class BaseTrainer:
 
                             # Compute expected values (continuous offsets)
                             # bins: [1, reg_max] → broadcast over B,4,H,W
-                            sp_val = torch.sum(sp_prob * bins, dim=2)  # [B, 4, H, W]
-                            tp_val = torch.sum(tp_prob * bins, dim=2)  # [B, 4, H, W]
+                            # sp_val = torch.sum(sp_prob * bins, dim=2)  # [B, 4, H, W]
+                            # tp_val = torch.sum(tp_prob * bins, dim=2)  # [B, 4, H, W]
+                            sp_val = (torch.sum(sp_prob * bins, dim=2) / reg_max)
+                            tp_val = (torch.sum(tp_prob * bins, dim=2) / reg_max)
 
                             # Compute squared error per coordinate → [B, 4, H, W]
                             sq_error = (sp_val - tp_val) ** 2

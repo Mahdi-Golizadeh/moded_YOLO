@@ -740,7 +740,7 @@ class BaseTrainer:
                         count = 0
 
                         # Precompute bins once (shape: [1, reg_max])
-                        bins = torch.arange(reg_max, device=self.device, dtype=torch.float32).unsqueeze(0)  # [1, reg_max]
+                        bins = torch.arange(reg_max, device=self.device, dtype=torch.float32).view(1, 1, reg_max, 1, 1)  # [1,1,16,1,1]  # [1, reg_max]
 
                         for scale_idx in range(len(preds)):
                             sp = preds[scale_idx]      # [B, Ctot, H, W]

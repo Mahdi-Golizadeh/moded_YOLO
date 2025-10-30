@@ -523,13 +523,13 @@ class BaseTrainer:
                 dfl_dist = True
                 l2_dist = True
                 # Forward
-                import pickle
+                # import pickle
                 with autocast(self.amp):
                     batch = self.preprocess_batch(batch)
                     # print(type(batch))
                     # Save to file
-                    with open('my_dict.pkl', 'wb') as f:
-                        pickle.dump(batch, f)
+                    # with open('my_dict.pkl', 'wb') as f:
+                    #     pickle.dump(batch, f)
                     progress = (epoch + 1) / self.args.epochs
                     # Forward pass through student and teacher
                     student_out = self.model(batch)
@@ -539,7 +539,7 @@ class BaseTrainer:
                     # creating mask based on pure teacher's output
                     # ===== CONFIGURABLE OPTIONS =====
                     use_topk = True          # Set True to use top-k adaptive thresholding (Option 2)
-                    topk_ratio = 0.2          # Keep top 20% of locations per image (only used if use_topk=True)
+                    topk_ratio = 0.1          # Keep top 20% of locations per image (only used if use_topk=True)
 
                     use_dfl_objectness = True  # Set True to modulate by DFL entropy (Option 4)
 

@@ -266,8 +266,8 @@ class v8DetectionLoss:
         pred_bboxes = self.bbox_decode(anchor_points, pred_distri)  # xyxy, (b, h*w, 4)
         # dfl_conf = pred_distri.view(batch_size, -1, 4, self.reg_max).detach().softmax(-1)
         # dfl_conf = (dfl_conf.amax(-1).mean(-1) + dfl_conf.amax(-1).amin(-1)) / 2
-
-        _, target_bboxes, target_scores, fg_mask, _ = self.assigner(
+        
+        target_labels, target_bboxes, target_scores, fg_mask, target_gt_idx, norm_align_metric = self.assigner(
             # pred_scores.detach().sigmoid() * 0.8 + dfl_conf.unsqueeze(-1) * 0.2,
             pred_scores.detach().sigmoid(),
             (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
@@ -294,7 +294,7 @@ class v8DetectionLoss:
         loss[1] *= self.hyp.cls  # cls gain
         loss[2] *= self.hyp.dfl  # dfl gain
 
-        return loss * batch_size, loss.detach(), fg_mask  # loss(box, cls, dfl)
+        return loss * batch_size, loss.detach(), target_labels, target_bboxes, target_scores, fg_mask, target_gt_idx, norm_align_metric  # loss(box, cls, dfl)
 
 
 class v8SegmentationLoss(v8DetectionLoss):

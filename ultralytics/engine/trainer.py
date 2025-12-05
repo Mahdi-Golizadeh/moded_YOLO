@@ -23,6 +23,7 @@ import torch
 import torch.nn.functional as F
 from torch import distributed as dist
 from torch import nn, optim
+from scipy.ndimage import label
 
 from ultralytics import __version__
 from ultralytics.cfg import get_cfg, get_save_dir
@@ -58,6 +59,86 @@ from ultralytics.utils.torch_utils import (
     unset_deterministic,
 )
 
+
+def generate_masks_from_teacher_tal(t_mask, teacher_preds, mask_type="pyramid"):
+    """
+    Generate:
+      1) Original TAL masks (hard binary per level)
+      2) Mask Pyramid (multi-scale OR fusion mask)
+
+    Args:
+        t_mask: [B, 8400] boolean mask from TAL.
+        teacher_preds: list of three prediction tensors:
+            [B, C, 80, 80], [B, C, 40, 40], [B, C, 20, 20]
+        mask_type: 
+            "original" -> return only original masks
+            "pyramid"  -> return only pyramid masks
+            "both"     -> return both (default)
+
+    Returns:
+        Based on mask_type:
+            original_masks: [B,1,80,80], [B,1,40,40], [B,1,20,20]
+            pyramid_masks:  [B,1,80,80], [B,1,40,40], [B,1,20,20]
+    """
+
+    batch = t_mask.shape[0]
+
+    # Extract spatial sizes dynamically
+    spatial_dims = [(p.shape[2], p.shape[3]) for p in teacher_preds]
+
+    # ---------------------------------------------------------
+    # 1. ORIGINAL HARD (BINARY) MASKS
+    # ---------------------------------------------------------
+    original_masks = []
+    start = 0
+
+    for h, w in spatial_dims:
+        N = h * w
+        end = start + N
+
+        # boolean -> float 0/1
+        mask = t_mask[:, start:end].float()
+        mask = mask.reshape(batch, 1, h, w)
+
+        original_masks.append(mask)
+        start = end
+
+    m3, m4, m5 = original_masks  # 80x80, 40x40, 20x20
+
+    # If user wants only original masks
+    if mask_type == "original":
+        return original_masks
+
+    # ---------------------------------------------------------
+    # 2. MASK PYRAMID (MULTI-SCALE OR)
+    # ---------------------------------------------------------
+
+    # Step A: Upsample 40→80 and 20→80
+    m4_up = F.interpolate(m4, size=(80, 80), mode="nearest")
+    m5_up = F.interpolate(m5, size=(80, 80), mode="nearest")
+
+    # Ensure float domain (binary mix safety)
+    m3f = m3.float()
+    m4f = m4_up.float()
+    m5f = m5_up.float()
+
+    # Step B: OR fusion across scales
+    # OR rule: if any mask has 1 → output must be 1
+    pyramid_80 = torch.maximum(torch.maximum(m3f, m4f), m5f)
+    # Equivalent to OR: pyramid_80 = (m3f > 0) | (m4f > 0) | (m5f > 0)
+
+    # Step C: Downscale back to 40 and 20
+    pyramid_40 = F.interpolate(pyramid_80, size=(40, 40), mode="nearest")
+    pyramid_20 = F.interpolate(pyramid_80, size=(20, 20), mode="nearest")
+
+    pyramid_masks = [pyramid_80, pyramid_40, pyramid_20]
+
+    # If user wants only pyramid
+    if mask_type == "pyramid":
+        return pyramid_masks
+
+    # Else return both
+    return original_masks, pyramid_masks
 
 class BaseTrainer:
     """
@@ -168,7 +249,7 @@ class BaseTrainer:
             vid_stride=self.args.vid_stride,
             stream_buffer=self.args.stream_buffer,
             visualize=self.args.visualize,
-            augment=self.args.augment,
+            augment=False,  # Disable augmentation
             agnostic_nms=self.args.agnostic_nms,
             classes=self.args.classes,
             retina_masks=self.args.retina_masks,
@@ -204,24 +285,24 @@ class BaseTrainer:
             pose=12.0,
             kobj=1.0,
             nbs=64,
-            hsv_h=0.015,
-            hsv_s=0.7,
-            hsv_v=0.4,
-            degrees=0.0,
-            translate=0.1,
-            scale=0.5,
-            shear=0.0,
-            perspective=0.0,
-            flipud=0.0,
-            fliplr=0.5,
-            bgr=0.0,
-            mosaic=1.0,
-            mixup=0.0,
-            cutmix=0.0,
-            copy_paste=0.0,
+            hsv_h=0.0,  # No hue augmentation
+            hsv_s=0.0,  # No saturation augmentation
+            hsv_v=0.0,  # No value augmentation
+            degrees=0.0,  # No rotation
+            translate=0.0,  # No translation
+            scale=0.0,  # No scaling
+            shear=0.0,  # No shearing
+            perspective=0.0,  # No perspective transformation
+            flipud=0.0,  # No vertical flipping
+            fliplr=0.0,  # No horizontal flipping
+            bgr=0.0,  # No color channel swapping
+            mosaic=0.0,  # No mosaic augmentation
+            mixup=0.0,  # No mixup augmentation
+            cutmix=0.0,  # No cutmix augmentation
+            copy_paste=0.0,  # No copy-paste augmentation
             copy_paste_mode="flip",
-            auto_augment="randaugment",
-            erasing=0.4,
+            auto_augment=None,  # Disable auto augmentation
+            erasing=0.0,  # No random erasing
             cfg=None,
             tracker="botsort.yaml",
             save_dir="runs/detect/train32",
@@ -275,6 +356,12 @@ class BaseTrainer:
         self.tloss = None
         self.loss_names = ["Loss"]
         self.csv = self.save_dir / "results.csv"
+        # ---- Distillation CSV Logger ----
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+        self.distill_csv = self.save_dir / f"distill_losses_{timestamp}.csv"
+        # Write header
+        with open(self.distill_csv, "w") as f:
+            f.write("epoch,cls_distill_loss,dfl_distill_loss,box_reg_distill_loss\n")
         self.plot_idx = [0, 1, 2]
 
         # HUB
@@ -487,6 +574,10 @@ class BaseTrainer:
         self.optimizer.zero_grad()  # zero any resumed gradients to ensure stability on train start
         while True:
             self.epoch = epoch
+            # Epoch-level distillation loss accumulators
+            cls_distill_loss_epoch = 0.0
+            dfl_distill_loss_epoch = 0.0
+            box_reg_distill_loss_epoch = 0.0
             self.run_callbacks("on_train_epoch_start")
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")  # suppress 'Detected lr_scheduler.step() before optimizer.step()'
@@ -505,6 +596,7 @@ class BaseTrainer:
                 LOGGER.info(self.progress_string())
                 pbar = TQDM(enumerate(self.train_loader), total=nb)
             self.tloss = None
+    
             for i, batch in pbar:
                 self.run_callbacks("on_train_batch_start")
                 # Warmup
@@ -519,131 +611,102 @@ class BaseTrainer:
                         )
                         if "momentum" in x:
                             x["momentum"] = np.interp(ni, xi, [self.args.warmup_momentum, self.args.momentum])
-                kls_dist = True
-                dfl_dist = True
-                l2_dist = True
+                cls_dist = False
+                cls_dist_kl = False
+                dfl_dist = False
+                M2D2 = False
+                l2_dist = False
+                cls_fg_mask = False  # Set to True to apply spatial foreground mask, False to disable
+                dfl_fg_mask = False
+                l2_fg_mask = False  # Set to False to disable spatial masking
                 # Forward
-                # import pickle
+            
                 with autocast(self.amp):
                     batch = self.preprocess_batch(batch)
-                    # print(type(batch))
-                    # Save to file
-                    # with open('my_dict.pkl', 'wb') as f:
-                    #     pickle.dump(batch, f)
                     progress = (epoch + 1) / self.args.epochs
                     # Forward pass through student and teacher
                     student_out = self.model(batch)
+                    
                     with torch.no_grad():
                         teacher_out = self.teacher(batch)
                     teacher_preds = teacher_out[1]
-                    # creating mask based on pure teacher's output
-                    # ===== CONFIGURABLE OPTIONS =====
-                    use_topk = True          # Set True to use top-k adaptive thresholding (Option 2)
-                    topk_ratio = 0.2          # Keep top 20% of locations per image (only used if use_topk=True)
-                    use_dfl_objectness = True  # Set True to modulate by DFL entropy (Option 4)
-
-                    # ===== FIXED HYPERPARAMETERS =====
-                    num_classes = 80
-                    reg_max = 16
-                    dfl_channels = 4 * reg_max
-                    base_conf_thresh = 0.25   # Only used if use_topk=False
-                    eps = 1e-8
-                    max_ent = math.log(reg_max)  # ~2.7726 for reg_max=16
-
-                    # ===== GENERATE MASKS =====
-                    teacher_fg_masks = []
-                    for pred in teacher_preds:
-                        B, C, H, W = pred.shape
-                        assert C == dfl_channels + num_classes, f"Channel mismatch: expected {dfl_channels + num_classes}, got {C}"
-
-                        # --- 1. Classification confidence ---
-                        cls_pred = pred[:, dfl_channels:, :, :]  # [B, 80, H, W]
-                        cls_conf = cls_pred.sigmoid().max(dim=1)[0]  # [B, H, W]
-
-                        # --- 2. (Optional) DFL-based objectness weighting ---
-                        if use_dfl_objectness:
-                            dfl_pred = pred[:, :dfl_channels, :, :]  # [B, 64, H, W]
-                            dfl_probs = dfl_pred.view(B, 4, reg_max, H, W).softmax(dim=2)  # [B, 4, 16, H, W]
-                            entropy = -(dfl_probs * torch.log(dfl_probs + eps)).sum(dim=2)  # [B, 4, H, W]
-                            mean_entropy = entropy.mean(dim=1)  # [B, H, W]
-                            norm_entropy = torch.clamp(mean_entropy / max_ent, 0.0, 1.0)
-                            objectness_dfl = 1.0 - norm_entropy  # [B, H, W]
-                            joint_conf = cls_conf * objectness_dfl
-                        else:
-                            joint_conf = cls_conf
-
-                        # --- 3. Thresholding: fixed vs top-k ---
-                        if use_topk:
-                            # Flatten spatial dimensions: [B, H*W]
-                            conf_flat = joint_conf.view(B, -1)
-                            num_keep = max(1, int(topk_ratio * H * W))
-                            # Get the k-th largest value per image (threshold)
-                            topk_vals, _ = torch.topk(conf_flat, num_keep, dim=1, sorted=False)
-                            thresh = topk_vals.min(dim=1, keepdim=True)[0]  # [B, 1]
-                            # Broadcast threshold to [B, H, W]
-                            thresh = thresh.view(B, 1, 1).expand(-1, H, W)
-                            fg_mask = joint_conf >= thresh
-                        else:
-                            fg_mask = joint_conf > base_conf_thresh
-
-                        teacher_fg_masks.append(fg_mask)
-                    
-                    # torch.save(teacher_fg_masks, "fg_masks_batch4.pt")
-                    # end of creating mask
+                    _, _, target_labels, target_bboxes, target_scores, t_mask, target_gt_idx, norm_align_metric = teacher_out[0]
+                    # torch.save({
+                    #     "target_labels": target_labels,
+                    #     "target_bboxes": target_bboxes,
+                    #     "target_scores": target_scores,
+                    #     "t_mask": t_mask,
+                    #     "target_gt_idx": target_gt_idx,
+                    #     "norm_align_metric": norm_align_metric,
+                    # }, "tensors.pt")
+                    mask = generate_masks_from_teacher_tal(t_mask, teacher_preds)
+                    print(t_mask.shape, mask[0].shape)
                     # Standard YOLO loss & predictions
-                    loss, self.loss_items, st_mask = student_out[0]
+                    loss, self.loss_items, _ ,_,_,_,_,_= student_out[0]
                     self.loss = loss.sum()
                     student_preds = student_out[1]
-                    # teacher_preds = t1[1]
-                    
-                    if kls_dist == True:
+                    if cls_dist == True:
                         # --- class Distillation setup ---
-                        class_channels = 80
-                        per_scale_weights = [
-                            1.5 - 0.5 * progress,  # small objects
-                            1.0,                   # medium
-                            0.5 + 0.5 * progress,  # large objects
-                        ]
+                        class_channels = self.data['nc']
+                        per_scale_weights = [1., 1., 1.]                                    
+                        alpha = 1.0 
+                        T = 1.0 
                         
-                        alpha = 0.01 + 0.09 * min(1.0, progress * 2.0)
-                        T = 3.0 - 1.5 * min(1.0, progress * 1.5)
-
-                        # >>> NEW: Toggle mask usage <<<
-                        use_fg_mask = True  # Set to False to disable spatial foreground mask
-
+                        # New option (set externally)
+                        # cls_dist_kl = True  -> use KL divergence distillation
+                        # cls_dist_kl = False -> use original BCE distillation
                         distill_cls_loss = 0.0
 
                         for i, (s_pred, t_pred) in enumerate(zip(student_preds, teacher_preds)):
                             # --- Extract class logits ---
-                            s_logits = s_pred[:, -class_channels:, :, :]  # [B, 80, H, W]
-                            t_logits = t_pred[:, -class_channels:, :, :]  # [B, 80, H, W]
+                            s_logits = s_pred[:, -class_channels:, :, :]  # [B, C, H, W]
+                            t_logits = t_pred[:, -class_channels:, :, :]  # [B, C, H, W]
 
-                            # --- Teacher probabilities with temperature ---
-                            with torch.no_grad():
-                                t_probs = torch.sigmoid(t_logits / T)  # [B, 80, H, W]
+                            if not cls_dist_kl:
+                                ############################################################
+                                #  ORIGINAL BCE-SIGMOID DISTILLATION
+                                ############################################################
+                                with torch.no_grad():
+                                    t_probs = torch.sigmoid(t_logits / T)
 
-                            # --- Start building combined mask ---
-                            combined_mask = None
+                                bce = F.binary_cross_entropy_with_logits(
+                                    s_logits, t_probs, reduction='none'
+                                )  # [B, C, H, W]
 
-                            # 2. Spatial foreground mask (from your earlier generation)
-                            if use_fg_mask:
-                                # Assume `teacher_fg_masks` is already computed and available in scope
-                                fg_mask = teacher_fg_masks[i].float().unsqueeze(1)  # [B, 1, H, W]
-                                if combined_mask is not None:
-                                    combined_mask = combined_mask * fg_mask  # logical AND (both must be true)
+                                if cls_fg_mask:
+                                    fg_mask = mask[i]  # [B,1,H,W]
+                                    masked_bce = bce * fg_mask
+                                    active_elems = fg_mask.sum() * class_channels + 1e-6
+                                    loss_ = masked_bce.sum() / active_elems
                                 else:
-                                    combined_mask = fg_mask
+                                    loss_ = bce.mean()
 
-                            # --- Compute distillation loss ---
-                            bce = F.binary_cross_entropy_with_logits(s_logits, t_probs, reduction='none')  # [B, 80, H, W]
-
-                            if combined_mask is not None:
-                                # Apply mask: broadcast over 80 classes
-                                masked_bce = bce * combined_mask  # [B, 80, H, W]
-                                active_elems = combined_mask.sum() * class_channels + 1e-6
-                                loss_ = masked_bce.sum() / active_elems
                             else:
-                                loss_ = bce.mean()
+                                ############################################################
+                                #  NEW KL-SOFTMAX DISTILLATION OVER CLASS DIMENSION
+                                ############################################################
+                                # Softmax across class channels
+                                # shape: [B, C, H, W]
+                                with torch.no_grad():
+                                    t_probs = F.softmax(t_logits / T, dim=1)
+
+                                s_log_probs = F.log_softmax(s_logits / T, dim=1)
+
+                                # KL across class dimension (per pixel)
+                                # kl: [B, H, W]
+                                kl = F.kl_div(s_log_probs, t_probs, reduction='none')  # shape [B, C, H, W]
+                                kl = kl.sum(dim=1)  # sum over class dimension → [B, H, W]
+
+                                # Temperature correction (standard in Hinton KD)
+                                kl = kl * (T * T)
+
+                                if cls_fg_mask:
+                                    fg_mask = mask[i]  # [B,1,H,W]
+                                    masked_kl = kl * fg_mask
+                                    active_elems = fg_mask.sum() + 1e-6
+                                    loss_ = masked_kl.sum() / active_elems
+                                else:
+                                    loss_ = kl.mean()
 
                             # Weighted accumulation
                             distill_cls_loss += per_scale_weights[i] * loss_
@@ -652,26 +715,100 @@ class BaseTrainer:
                         self.loss += alpha * distill_cls_loss
                         
                         # Optional logging
-                        print(f"kls Distillation loss (normalized): {distill_cls_loss.item():.4f}")
-                        # end of cls distillation
-                    if dfl_dist == True:
-                        # ----- DFL distillation starts here -----
-                        num_classes = 80
+                        cls_distill_loss_epoch += (alpha * distill_cls_loss.item())
+                    if M2D2 == True:
+                        # flatten each tensor to [4, -1]
+                        flat_masks = [m.view(m.size(0), -1) for m in mask]
+
+                        # concatenate along dimension 1 -> [4, 8400]
+                        unified = torch.cat(flat_masks, dim=1)
+                        print(unified.shape)
+                        shapes=((80,80),(40,40),(20,20))
+                        B, N = t_mask.shape
+                        mask_splits = torch.split(unified.bool().cpu(), (6400, 1600, 400), dim=1)
+                        label_splits = torch.split(target_labels.cpu(), (6400, 1600, 400), dim=1)
+                        updated_preds = []
+                        
+                        for lvl, feat in enumerate(teacher_preds):
+                            # Save device and dtype to reconstruct final tensors
+                            device = feat.device
+                            dtype = feat.dtype
+                            b, C, H, W = feat.shape
+                            # Work with a clone to avoid modifying input in-place
+                            feat_flat = feat.view(b, C, -1).clone()  # [B, C, HW]
+                            cls_part = feat_flat[:, -self.data['nc']:, :]     # [B, num_classes, HW]
+                            dfl_part = feat_flat[:, :C - self.data['nc'], :]     # [B, dfl_ch, HW]
+                            
+                            # For CPU labeling we need flattened length and shapes
+                            HW = H * W
+                            # We'll do replacements in-place on dfl_part (which is on `device`)
+                            # Loop per batch image
+                            mask_flat_cpu = mask_splits[lvl].cpu()    # [B, HW] on CPU
+                            label_flat_cpu = label_splits[lvl].cpu()  # [B, HW] on CPU
+                            for bi in range(B):
+                                # get 1/0 mask as numpy 2D for scipy.label
+                                mask_1d = mask_flat_cpu[bi].numpy().astype(np.uint8)   # [HW]
+                                if mask_1d.sum() == 0:
+                                    continue
+                                Hs, Ws = shapes[lvl]
+                                mask_2d = mask_1d.reshape(Hs, Ws)
+                                labeled_array, num_features = label(mask_2d)
+                                
+                                if num_features == 0:
+                                    continue
+                                
+                                # flattened arrays for class lookup
+                                labels_np = label_flat_cpu[bi].numpy()  # [HW], int class ids
+                                labeled_flat = labeled_array.reshape(-1)  # [HW]
+                                
+                                # Iterate components
+                                for comp_id in range(1, num_features + 1):
+                                    comp_idx_np = np.nonzero(labeled_flat == comp_id)[0]  # indices into flattened HW
+                                    if comp_idx_np.size == 0:
+                                        continue
+                                    
+                                    # classes present in this component
+                                    classes_in_comp = np.unique(labels_np[comp_idx_np])
+                                    
+                                    # For each class, find indices inside component with that class
+                                    for cls in classes_in_comp:
+                                        # boolean selection inside comp for this class
+                                        sel_mask = (labels_np[comp_idx_np] == cls)
+                                        if not np.any(sel_mask):
+                                            continue
+                                        cls_positions_np = comp_idx_np[sel_mask]  # numpy indices (1D)
+                                        # convert to torch LongTensor on device for indexing
+                                        pos_idx = torch.from_numpy(cls_positions_np).long().to(device)  # [K]
+
+                                        if pos_idx.numel() == 0:
+                                            continue
+                                        
+                                        # Gather DFL vectors at these positions: shape [dfl_ch, K]
+                                        # dfl_part[bi]: [dfl_ch, HW]
+                                        vals = dfl_part[bi][:, pos_idx]  # [dfl_ch, K]
+
+                                        # compute average vector over K -> [dfl_ch, 1]
+                                        avg_vec = vals.mean(dim=1, keepdim=True)  # [dfl_ch, 1]
+
+                                        # Broadcast-assign averaged vector to all those positions
+                                        dfl_part[bi][:, pos_idx] = avg_vec  # replaced in-place
+                            # Reconstruct the feature map: concat cls + updated dfl
+                            new_feat_flat = torch.cat([cls_part, dfl_part], dim=1)  # [B, C, HW]
+                            new_feat = new_feat_flat.view(b, C, H, W).to(device=device, dtype=dtype)
+                            updated_preds.append(new_feat)
+                        # ----- M2D2 distillation starts here -----
                         reg_max = 16
-                        T = 3.0 - 1.5 * min(1.0, progress * 1.5)
+                        T = 1.0 
                         lambda_d = 0.5
 
-                        # >>> NEW: Toggle mask usage <<<
-                        use_fg_mask = True  # Set to False to disable spatial masking
-
-                        distill_loss = 0.0
+                        dfl_distill_loss = 0.0
                         count = 0
 
                         for scale_idx in range(len(student_preds)):
                             sp = student_preds[scale_idx]      # [B, Ctot, H, W]
-                            tp = teacher_preds[scale_idx]
+                            tp = updated_preds[scale_idx]
 
-                            B, Ctot, H, W = sp.shape
+                            B, _, H, W = sp.shape
                             dfl_channels = 4 * reg_max
 
                             # Extract DFL logits (first 64 channels)
@@ -694,11 +831,11 @@ class BaseTrainer:
                             kl_spatial = kl_per_pixel.mean(dim=1)  # [B, H, W]  (you can also use .sum(dim=1))
 
                             # --- Apply foreground mask if enabled ---
-                            if use_fg_mask:
-                                fg_mask = teacher_fg_masks[scale_idx].float()  # [B, H, W], from your precomputed list
-                                masked_kl = kl_spatial * fg_mask
+                            if dfl_fg_mask:
+                                fg_mask = mask[scale_idx]  # [B, H, W], from your precomputed list
+                                masked_kl = kl_spatial * fg_mask.squeeze(1)
                                 # Normalize by number of active elements (not just batchmean)
-                                active = fg_mask.sum() + 1e-6
+                                active = fg_mask.squeeze(1).sum() + 1e-6
                                 loss_kl = masked_kl.sum() / active
                             else:
                                 # Original: mean over all pixels and batch
@@ -707,29 +844,92 @@ class BaseTrainer:
                             # Scale by T^2 (standard in distillation)
                             loss_kl = loss_kl * (T ** 2)
 
-                            distill_loss += loss_kl
+                            dfl_distill_loss += loss_kl
                             count += 1
 
                         # Average across scales
                         if count > 0:
-                            distill_loss = distill_loss / count
+                            dfl_distill_loss = dfl_distill_loss / count
 
                         # Final weight
-                        distill_loss = lambda_d * distill_loss
-                        print(f"dfl_distill is: {distill_loss.item():.6f}")
+                        dfl_distill_loss = lambda_d * dfl_distill_loss
 
                         # Add to total loss
-                        self.loss += distill_loss
+                        self.loss += dfl_distill_loss
+
+                        # Accumulate epoch-level DFL KD loss
+                        dfl_distill_loss_epoch += dfl_distill_loss.item()
+                        # M2D2 distillation ends here                
+                    if dfl_dist == True:
+                        # ----- DFL distillation starts here -----
+                        reg_max = 16
+                        T = 1.0 
+                        lambda_d = 0.5
+
+                        dfl_distill_loss = 0.0
+                        count = 0
+
+                        for scale_idx in range(len(student_preds)):
+                            sp = student_preds[scale_idx]      # [B, Ctot, H, W]
+                            tp = teacher_preds[scale_idx]
+
+                            B, _, H, W = sp.shape
+                            dfl_channels = 4 * reg_max
+
+                            # Extract DFL logits (first 64 channels)
+                            sp_dfl = sp[:, :dfl_channels, :, :]   # [B, 64, H, W]
+                            tp_dfl = tp[:, :dfl_channels, :, :]   # [B, 64, H, W]
+
+                            # Reshape to [B, 4, reg_max, H, W]
+                            sp_reshaped = sp_dfl.view(B, 4, reg_max, H, W)
+                            tp_reshaped = tp_dfl.view(B, 4, reg_max, H, W)
+
+                            # Compute KL divergence per location and coordinate
+                            with torch.no_grad():
+                                tp_soft = torch.softmax(tp_reshaped / T, dim=2)  # [B, 4, reg_max, H, W]
+                            sp_logsoft = torch.log_softmax(sp_reshaped / T, dim=2)  # [B, 4, reg_max, H, W]
+
+                            # KL divergence: [B, 4, H, W] (sum over reg_max)
+                            kl_per_pixel = torch.sum(tp_soft * (torch.log(tp_soft + 1e-8) - sp_logsoft), dim=2)  # [B, 4, H, W]
+
+                            # Reduce over the 4 coordinates (mean or sum)
+                            kl_spatial = kl_per_pixel.mean(dim=1)  # [B, H, W]  (you can also use .sum(dim=1))
+
+                            # --- Apply foreground mask if enabled ---
+                            if dfl_fg_mask:
+                                fg_mask = mask[scale_idx]  # [B, H, W], from your precomputed list
+                                masked_kl = kl_spatial * fg_mask.squeeze(1)
+                                # Normalize by number of active elements (not just batchmean)
+                                active = fg_mask.squeeze(1).sum() + 1e-6
+                                loss_kl = masked_kl.sum() / active
+                            else:
+                                # Original: mean over all pixels and batch
+                                loss_kl = kl_spatial.mean()
+
+                            # Scale by T^2 (standard in distillation)
+                            loss_kl = loss_kl * (T ** 2)
+
+                            dfl_distill_loss += loss_kl
+                            count += 1
+
+                        # Average across scales
+                        if count > 0:
+                            dfl_distill_loss = dfl_distill_loss / count
+
+                        # Final weight
+                        dfl_distill_loss = lambda_d * dfl_distill_loss
+
+                        # Add to total loss
+                        self.loss += dfl_distill_loss
+
+                        # Accumulate epoch-level DFL KD loss
+                        dfl_distill_loss_epoch += dfl_distill_loss.item()
                         # dfl distillation ends here
                     if l2_dist == True:
                         # ----- L2 box regression distillation starts here -----
-                        num_classes = 80
                         reg_max = 16
                         λ_box_reg = 1.0
-
-                        # >>> NEW: Toggle mask usage <<<
-                        use_fg_mask = True  # Set to False to disable spatial masking
-
+                        
                         box_reg_loss = 0.0
                         count = 0
 
@@ -756,9 +956,7 @@ class BaseTrainer:
                             tp_prob = torch.softmax(tp_reshaped, dim=2)  # [B, 4, reg_max, H, W]
 
                             # Compute expected values (continuous offsets)
-                            # bins: [1, reg_max] → broadcast over B,4,H,W
-                            # sp_val = torch.sum(sp_prob * bins, dim=2)  # [B, 4, H, W]
-                            # tp_val = torch.sum(tp_prob * bins, dim=2)  # [B, 4, H, W]
+                            
                             sp_val = (torch.sum(sp_prob * bins, dim=2) / reg_max)
                             tp_val = (torch.sum(tp_prob * bins, dim=2) / reg_max)
 
@@ -769,8 +967,8 @@ class BaseTrainer:
                             l2_spatial = sq_error.mean(dim=1)  # [B, H, W]
 
                             # --- Apply foreground mask if enabled ---
-                            if use_fg_mask:
-                                fg_mask = teacher_fg_masks[scale_idx].float()  # [B, H, W]
+                            if l2_fg_mask:
+                                fg_mask = mask[scale_idx].squeeze(1)  # [B, H, W]
                                 masked_l2 = l2_spatial * fg_mask
                                 active = fg_mask.sum() + 1e-6
                                 loss_reg = masked_l2.sum() / active
@@ -787,8 +985,10 @@ class BaseTrainer:
                         # Apply final weight
                         box_reg_loss = λ_box_reg * box_reg_loss
 
-                        print(f"L2 box regression loss: {box_reg_loss.item():.6f}")
                         self.loss += box_reg_loss
+
+                        # Accumulate epoch-level box regression KD loss
+                        box_reg_distill_loss_epoch += box_reg_loss.item()
                         #regression distillation ends here
                     # self.loss = loss.sum()
                     if RANK != -1:
@@ -833,7 +1033,23 @@ class BaseTrainer:
                         self.plot_training_samples(batch, ni)
 
                 self.run_callbacks("on_train_batch_end")
-
+            # Log epoch-level distillation losses
+            if RANK in {-1, 0}:
+                LOGGER.info(
+                    f"Epoch {epoch + 1}: "
+                    f"cls_distill_loss_epoch={cls_distill_loss_epoch:.6f}, "
+                    f"dfl_distill_loss_epoch={dfl_distill_loss_epoch:.6f}, "
+                    f"box_reg_distill_loss_epoch={box_reg_distill_loss_epoch:.6f}"
+                )
+            
+            if RANK in {-1, 0}:  # Only main process logs to file
+                with open(self.distill_csv, "a") as f:
+                    f.write(
+                        f"{epoch + 1},"
+                        f"{cls_distill_loss_epoch:.6f},"
+                        f"{dfl_distill_loss_epoch:.6f},"
+                        f"{box_reg_distill_loss_epoch:.6f}\n"
+                    )
             self.lr = {f"lr/pg{ir}": x["lr"] for ir, x in enumerate(self.optimizer.param_groups)}  # for loggers
             self.run_callbacks("on_train_epoch_end")
             if RANK in {-1, 0}:

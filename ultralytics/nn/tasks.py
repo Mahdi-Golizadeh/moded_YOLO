@@ -156,7 +156,7 @@ class BaseModel(torch.nn.Module):
             return self._predict_augment(x)
         return self._predict_once(x, profile, visualize, embed)
 
-    def _predict_once(self, x, profile=False, visualize=False, embed=None):
+    def _predict_once(self, x, profile=False, visualize=False, embed=None, return_neck_feats=True):
         """
         Perform a forward pass through the network.
 
@@ -169,23 +169,31 @@ class BaseModel(torch.nn.Module):
         Returns:
             (torch.Tensor): The last output of the model.
         """
+        distill_layers = {16, 19, 22}
         y, dt, embeddings = [], [], []  # outputs
+        neck_feats = [] if return_neck_feats else None
         embed = frozenset(embed) if embed is not None else {-1}
         max_idx = max(embed)
         for m in self.model:
+            # print(m.i, m.f, m.type)
             if m.f != -1:  # if not from previous layer
                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
             if profile:
                 self._profile_one_layer(m, x, dt)
             x = m(x)  # run
             y.append(x if m.i in self.save else None)  # save output
+            # ---------- ADD THIS BLOCK ----------
+            if return_neck_feats and m.i in distill_layers:
+                # print(m.i, x.shape)
+                neck_feats.append(x)
+            # -----------------------------------
             if visualize:
                 feature_visualization(x, m.type, m.i, save_dir=visualize)
             if m.i in embed:
                 embeddings.append(torch.nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))  # flatten
                 if m.i == max_idx:
                     return torch.unbind(torch.cat(embeddings, 1), dim=0)
-        return x
+        return (x, neck_feats) if return_neck_feats else x
 
     def _predict_augment(self, x):
         """Perform augmentations on input image x and return augmented inference."""
@@ -335,7 +343,11 @@ class BaseModel(torch.nn.Module):
             self.criterion = self.init_criterion()
 
         preds = self.forward(batch["img"]) if preds is None else preds
-        return self.criterion(preds, batch)
+    
+        if isinstance(preds[0], tuple):
+            return self.criterion(preds[0], batch)
+        else:
+            return self.criterion(preds, batch)
 
     def losswithpreds(self, batch, preds=None):
         """
@@ -349,7 +361,11 @@ class BaseModel(torch.nn.Module):
             self.criterion = self.init_criterion()
 
         preds = self.forward(batch["img"]) if preds is None else preds
-        return self.criterion(preds, batch), preds
+
+        if isinstance(preds, tuple):
+            return self.criterion(preds[0], batch), preds
+        else:
+            return self.criterion(preds, batch), preds
     
     def init_criterion(self):
         """Initialize the loss criterion for the BaseModel."""
@@ -428,7 +444,10 @@ class DetectionModel(BaseModel):
 
             self.model.eval()  # Avoid changing batch statistics until training begins
             m.training = True  # Setting it to True to properly return strides
-            m.stride = torch.tensor([s / x.shape[-2] for x in _forward(torch.zeros(1, ch, s, s))])  # forward
+            if isinstance(_forward(torch.zeros(1, ch, s, s)), tuple):
+                m.stride = torch.tensor([s / x.shape[-2] for x in _forward(torch.zeros(1, ch, s, s))[0]])  # forward
+            else: 
+                m.stride = torch.tensor([s / x.shape[-2] for x in _forward(torch.zeros(1, ch, s, s))])  # forward
             self.stride = m.stride
             self.model.train()  # Set model back to training(default) mode
             m.bias_init()  # only run once

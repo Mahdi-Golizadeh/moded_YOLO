@@ -619,6 +619,7 @@ class BaseTrainer:
                 cls_fg_mask = False  # Set to True to apply spatial foreground mask, False to disable
                 dfl_fg_mask = False
                 l2_fg_mask = False  # Set to False to disable spatial masking
+                feat_distill = True
                 # Forward
             
                 with autocast(self.amp):
@@ -629,7 +630,10 @@ class BaseTrainer:
                     
                     with torch.no_grad():
                         teacher_out = self.teacher(batch)
-                    teacher_preds = teacher_out[1]
+                    if feat_distill:
+                        teacher_preds, teacher_necks = teacher_out[1]
+                    else:
+                        teacher_preds = teacher_out[1]
                     _, _, target_labels, target_bboxes, target_scores, t_mask, target_gt_idx, norm_align_metric = teacher_out[0]
                     # torch.save({
                     #     "target_labels": target_labels,
@@ -640,7 +644,7 @@ class BaseTrainer:
                     #     "norm_align_metric": norm_align_metric,
                     # }, "tensors.pt")
                     mask = generate_masks_from_teacher_tal(t_mask, teacher_preds)
-                    print(t_mask.shape, mask[0].shape)
+                    # print(t_mask.shape, mask[0].shape)
                     # Standard YOLO loss & predictions
                     loss, self.loss_items, _ ,_,_,_,_,_= student_out[0]
                     self.loss = loss.sum()
@@ -722,7 +726,7 @@ class BaseTrainer:
 
                         # concatenate along dimension 1 -> [4, 8400]
                         unified = torch.cat(flat_masks, dim=1)
-                        print(unified.shape)
+                        # print(unified.shape)
                         shapes=((80,80),(40,40),(20,20))
                         B, N = t_mask.shape
                         mask_splits = torch.split(unified.bool().cpu(), (6400, 1600, 400), dim=1)

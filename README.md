@@ -14,7 +14,6 @@ The implementation systematically tests various distillation approaches at diffe
 - **Neck-Level Distillation**: Multi-scale feature map distillation from the feature pyramid network
 - **Multi-Modal Distillation (M2D2)**: Our proposed multimodal approach for DFL head distillation
 - **Modular Architecture**: Easily extensible components for new distillation methods
-- **Configurable Experiments**: YAML-based configuration for reproducible experiments
 - **Comprehensive Logging**: Detailed experiment tracking, loss breakdowns, and visualizations
 - **Spatial Masking**: Intelligent foreground-aware masking for focused distillation
 
@@ -197,7 +196,6 @@ m2d2_alpha=1.0,          # Loss weight multiplier
 **Features:**
 - Combines distribution matching with feature alignment
 - Internally applies spatial masking
-- Works synergistically with other head distillation methods
 
 ### Regression Head Distillation
 
@@ -464,12 +462,6 @@ The framework logs:
 - Feature map visualizations (when enabled)
 - Attention map comparisons
 - Loss weight schedules
-
-### TensorBoard Integration
-```bash
-# Launch TensorBoard to visualize training
-tensorboard --logdir runs/train
-```
 
 ## Troubleshooting
 

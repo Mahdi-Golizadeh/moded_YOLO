@@ -24,6 +24,7 @@ import torch.nn.functional as F
 from torch import distributed as dist
 from torch import nn, optim
 from scipy.ndimage import label
+import pickle
 
 from ultralytics import __version__
 from ultralytics.cfg import get_cfg, get_save_dir
@@ -140,6 +141,314 @@ def generate_masks_from_teacher_tal(t_mask, teacher_preds, mask_type="pyramid"):
     # Else return both
     return original_masks, pyramid_masks
 
+class AutoNeckFeatureAdaptor(nn.Module):
+    def __init__(self, teacher_channels, student_channels):
+        super().__init__()
+
+        assert len(teacher_channels) == len(student_channels), \
+            "Teacher and student must have same number of neck levels"
+
+        self.adaptors = nn.ModuleList([
+            nn.Conv2d(
+                in_channels=t_ch,
+                out_channels=s_ch,
+                kernel_size=1,
+                bias=False
+            )
+            for t_ch, s_ch in zip(teacher_channels, student_channels)
+        ])
+
+    def forward(self, teacher_necks):
+        return [
+            adaptor(t_feat)
+            for adaptor, t_feat in zip(self.adaptors, teacher_necks)
+        ]
+
+class FeatureDistillationLoss(nn.Module):
+    """
+    Feature-level distillation loss supporting:
+    - L2 (MSE)
+    - Cosine similarity
+    """
+    def __init__(
+        self,
+        loss_type="l2",              # "l2" or "cosine"
+        level_weights=None,
+        eps=1e-6
+    ):
+        super().__init__()
+        assert loss_type in ["l2", "cosine"]
+        self.loss_type = loss_type
+        self.level_weights = level_weights
+        self.eps = eps
+
+    def _l2_loss(self, s_feat, t_feat, mask=None):
+        diff = (s_feat - t_feat) ** 2
+        if mask is not None:
+            mask = mask.expand_as(diff)
+            return (diff * mask).sum() / (mask.sum() + self.eps)
+        return diff.mean()
+
+    def _cosine_loss(self, s_feat, t_feat, mask=None):
+        # Normalize along channel dimension
+        s = F.normalize(s_feat, dim=1, eps=self.eps)
+        t = F.normalize(t_feat, dim=1, eps=self.eps)
+
+        # Cosine similarity per spatial location
+        cos_sim = (s * t).sum(dim=1, keepdim=True)
+        loss = 1.0 - cos_sim
+
+        if mask is not None:
+            return (loss * mask).sum() / (mask.sum() + self.eps)
+        return loss.mean()
+
+    def forward(self, student_necks, teacher_necks_adapted, masks=None):
+        assert len(student_necks) == len(teacher_necks_adapted)
+        if masks is not None:
+            assert len(masks) == len(student_necks)
+
+        total_loss = 0.0
+        num_levels = len(student_necks)
+
+        for i in range(num_levels):
+            s_feat = student_necks[i]
+            t_feat = teacher_necks_adapted[i]
+            mask = masks[i] if masks is not None else None
+
+            if self.loss_type == "l2":
+                loss = self._l2_loss(s_feat, t_feat, mask)
+            else:
+                loss = self._cosine_loss(s_feat, t_feat, mask)
+
+            if self.level_weights is not None:
+                loss = loss * self.level_weights[i]
+
+            total_loss += loss
+
+        return total_loss / num_levels
+
+def compute_attention_map(feat, p=2, eps=1e-6):
+    """
+    feat: [B, C, H, W]
+    returns: [B, 1, H, W]
+    """
+    attn = torch.sum(torch.abs(feat) ** p, dim=1, keepdim=True)
+    norm = torch.sqrt(torch.sum(attn ** 2, dim=(2, 3), keepdim=True))
+    return attn / (norm + eps)
+
+class AttentionMapDistillationLoss(nn.Module):
+    """
+    Attention map distillation with:
+    - L2 (MSE)
+    - Cosine similarity
+    """
+    def __init__(
+        self,
+        p=2,
+        loss_type="l2",              # "l2" or "cosine"
+        level_weights=None,
+        eps=1e-6
+    ):
+        super().__init__()
+        assert loss_type in ["l2", "cosine"]
+        self.p = p
+        self.loss_type = loss_type
+        self.level_weights = level_weights
+        self.eps = eps
+
+    def _l2_loss(self, A_s, A_t, mask=None):
+        diff = (A_s - A_t) ** 2
+        if mask is not None:
+            return (diff * mask).sum() / (mask.sum() + self.eps)
+        return diff.mean()
+
+    def _cosine_loss(self, A_s, A_t, mask=None):
+        # Flatten spatial dimensions
+        B = A_s.size(0)
+        A_s = A_s.view(B, -1)
+        A_t = A_t.view(B, -1)
+
+        cos_sim = F.cosine_similarity(A_s, A_t, dim=1)
+        loss = 1.0 - cos_sim
+
+        if mask is not None:
+            # Mask acts as spatial weighting
+            w = mask.view(B, -1).mean(dim=1)
+            return (loss * w).mean()
+
+        return loss.mean()
+
+    def forward(self, student_necks, teacher_necks, masks=None):
+        assert len(student_necks) == len(teacher_necks)
+        if masks is not None:
+            assert len(masks) == len(student_necks)
+
+        total_loss = 0.0
+        num_levels = len(student_necks)
+
+        for i in range(num_levels):
+            A_s = compute_attention_map(student_necks[i], p=self.p, eps=self.eps)
+            A_t = compute_attention_map(teacher_necks[i].detach(), p=self.p, eps=self.eps)
+            mask = masks[i] if masks is not None else None
+
+            if self.loss_type == "l2":
+                loss = self._l2_loss(A_s, A_t, mask)
+            else:
+                loss = self._cosine_loss(A_s, A_t, mask)
+
+            if self.level_weights is not None:
+                loss = loss * self.level_weights[i]
+
+            total_loss += loss
+
+        return total_loss / num_levels
+
+class UnifiedNeckDistillation(nn.Module):
+    """
+    Unified FPN / neck distillation module implementing:
+    - Channel-wise distillation (CWD)
+    - Correlation / relational distillation (CRD)
+    - Feature distribution matching (MMD)
+    - Spatial softmax attention distillation
+    - Channel attention (SE-style) distillation
+    """
+    def __init__(
+        self,
+        use_cwd=False,
+        use_crd=False,
+        use_mmd=False,
+        use_spatial_att=False,
+        use_channel_att=False,
+        level_weights=None,
+        mmd_kernel="rbf",
+        eps=1e-6
+    ):
+        super().__init__()
+
+        self.use_cwd = use_cwd
+        self.use_crd = use_crd
+        self.use_mmd = use_mmd
+        self.use_spatial_att = use_spatial_att
+        self.use_channel_att = use_channel_att
+
+        self.level_weights = level_weights
+        self.mmd_kernel = mmd_kernel
+        self.eps = eps
+
+    # ---------------------------------------------------------
+    # 1. Channel-wise Distillation (CWD)
+    # ---------------------------------------------------------
+    def _cwd_loss(self, s_feat, t_feat):
+        # GAP statistics
+        s_mu = s_feat.mean(dim=(2, 3))
+        t_mu = t_feat.mean(dim=(2, 3))
+        return F.mse_loss(s_mu, t_mu)
+
+    # ---------------------------------------------------------
+    # 2. Correlation / Relational Distillation (CRD)
+    # ---------------------------------------------------------
+    def _crd_loss(self, s_feat, t_feat):
+        B, C, H, W = s_feat.shape
+
+        s = s_feat.view(B, C, -1)
+        t = t_feat.view(B, C, -1)
+
+        s = F.normalize(s, dim=2)
+        t = F.normalize(t, dim=2)
+
+        R_s = torch.bmm(s, s.transpose(1, 2)) / (H * W)
+        R_t = torch.bmm(t, t.transpose(1, 2)) / (H * W)
+
+        return F.mse_loss(R_s, R_t)
+
+    # ---------------------------------------------------------
+    # 3. Maximum Mean Discrepancy (MMD)
+    # ---------------------------------------------------------
+    def _rbf_kernel(self, x, y, sigma=1.0):
+        x_norm = (x ** 2).sum(dim=1, keepdim=True)
+        y_norm = (y ** 2).sum(dim=1, keepdim=True)
+        dist = x_norm - 2 * torch.mm(x, y.t()) + y_norm.t()
+        return torch.exp(-dist / (2 * sigma ** 2))
+
+    def _mmd_loss(self, s_feat, t_feat):
+        s = s_feat.flatten(2).mean(dim=2)
+        t = t_feat.flatten(2).mean(dim=2)
+
+        K_ss = self._rbf_kernel(s, s)
+        K_tt = self._rbf_kernel(t, t)
+        K_st = self._rbf_kernel(s, t)
+
+        return K_ss.mean() + K_tt.mean() - 2 * K_st.mean()
+
+    # ---------------------------------------------------------
+    # 4. Spatial Softmax Attention
+    # ---------------------------------------------------------
+    def _spatial_attention_loss(self, s_feat, t_feat, mask=None):
+        B, _, H, W = s_feat.shape
+
+        A_s = s_feat.abs().sum(dim=1, keepdim=True)
+        A_t = t_feat.abs().sum(dim=1, keepdim=True)
+
+        A_s = F.softmax(A_s.view(B, -1), dim=1).view(B, 1, H, W)
+        A_t = F.softmax(A_t.view(B, -1), dim=1).view(B, 1, H, W)
+
+        diff = (A_s - A_t) ** 2
+        if mask is not None:
+            return (diff * mask).sum() / (mask.sum() + self.eps)
+        return diff.mean()
+
+    # ---------------------------------------------------------
+    # 5. Channel Attention (SE-style)
+    # ---------------------------------------------------------
+    def _channel_attention_loss(self, s_feat, t_feat):
+        s_att = s_feat.mean(dim=(2, 3))
+        t_att = t_feat.mean(dim=(2, 3))
+
+        s_att = F.softmax(s_att, dim=1)
+        t_att = F.softmax(t_att, dim=1)
+
+        return F.mse_loss(s_att, t_att)
+
+    # ---------------------------------------------------------
+    # Forward
+    # ---------------------------------------------------------
+    def forward(self, student_necks, teacher_necks, masks=None):
+        assert len(student_necks) == len(teacher_necks)
+        if masks is not None:
+            assert len(masks) == len(student_necks)
+
+        total_loss = 0.0
+        num_levels = len(student_necks)
+
+        for i in range(num_levels):
+            s_feat = student_necks[i]
+            t_feat = teacher_necks[i].detach()
+            mask = masks[i] if masks is not None else None
+
+            level_loss = 0.0
+
+            if self.use_cwd:
+                level_loss += self._cwd_loss(s_feat, t_feat)
+
+            if self.use_crd:
+                level_loss += self._crd_loss(s_feat, t_feat)
+
+            if self.use_mmd:
+                level_loss += self._mmd_loss(s_feat, t_feat)
+
+            if self.use_spatial_att:
+                level_loss += self._spatial_attention_loss(s_feat, t_feat, mask)
+
+            if self.use_channel_att:
+                level_loss += self._channel_attention_loss(s_feat, t_feat)
+
+            if self.level_weights is not None:
+                level_loss = level_loss * self.level_weights[i]
+
+            total_loss += level_loss
+
+        return total_loss / num_levels
+
 class BaseTrainer:
     """
     A base class for creating trainers.
@@ -201,9 +510,41 @@ class BaseTrainer:
             _callbacks (list, optional): List of callback functions.
         """
         self.args = get_cfg(cfg, overrides)
+        # ---- Distillation flags (defaults) ----
+        self.args.cls_dist = getattr(self.args, "cls_dist", False)
+        self.args.cls_dist_kl = getattr(self.args, "cls_dist_kl", False)
+        self.args.dfl_dist = getattr(self.args, "dfl_dist", False)
+        self.args.M2D2 = getattr(self.args, "M2D2", False)
+        self.args.l2_dist = getattr(self.args, "l2_dist", False)
+        self.args.cls_dist = getattr(self.args, "cls_dist", False)
+        self.args.cls_fg_mask = getattr(self.args, "cls_fg_mask", False)
+        self.args.dfl_fg_mask = getattr(self.args, "dfl_fg_mask", False)
+        self.args.l2_fg_mask = getattr(self.args, "l2_fg_mask", False)
+        self.args.feat_distill = getattr(self.args, "feat_distill", False)
+        self.args.feat = getattr(self.args, "feat", False)
+        self.args.feat_att = getattr(self.args, "feat_att", False)
+        self.args.feat_oth = getattr(self.args, "feat_oth", False)
+        self.args.feat_mask = getattr(self.args, "feat_mask", False) # None or mask
+        self.args.loss_ty = getattr(self.args, "loss_ty", "l2")#l2 or "cosine"
+        self.args.teacher_model = getattr(self.args,"teacher_model", "")
+        self.args.use_cwd= getattr(self.args, "use_cwd", False) # Channel-Wise Distillation (CWD)
+        self.args.use_crd= getattr(self.args, "use_crd", False) # Correlation / Relational Distillation (CRD-style)
+        self.args.use_mmd= getattr(self.args, "use_mmd", False) # Feature Distribution Matching (MMD)
+        self.args.use_spatial_att= getattr(self.args, "use_spatial_att", False) # Spatial Softmax Attention Distillation
+        self.args.use_channel_att= getattr(self.args, "use_channel_att", False) # Channel Attention Distillation (SE-style)
+        self.args.level_weights= getattr(self.args, "level_weights", [1., 1., 1.]) # channel weights for all feature distillation and cls distillation
+        self.args.feature_lambda= getattr(self.args, "feature_lambda", 1.) # feature loss weight multiplier
+        self.args.cls_dist_t= getattr(self.args, "cls_dist_t", 1.)
+        self.args.cls_alpha= getattr(self.args, "cls_alpha", 1.)
+        self.args.m2d2_t= getattr(self.args, "m2d2_t", 1.)
+        self.args.m2d2_alpha= getattr(self.args, "m2d2_alpha", 1.)
+        self.args.dfl_t= getattr(self.args, "dfl_t", 1.)
+        self.args.dfl_alpha= getattr(self.args, "dfl_alpha", 1.)
+        self.args.l2_alpha= getattr(self.args, "cls_alpha", 1.)
+        self.args.mask_type = getattr(self.args, "mask_type", "original") # original or pyramid
         self.teacher_args = SimpleNamespace(
             mode="train",
-            model="yolo11n.pt",
+            model=self.args.teacher_model,
             data=self.args.data,
             epochs=self.args.epochs,
             time=self.args.time,
@@ -359,9 +700,26 @@ class BaseTrainer:
         # ---- Distillation CSV Logger ----
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
         self.distill_csv = self.save_dir / f"distill_losses_{timestamp}.csv"
-        # Write header
+        
+        # ---- Distillation loss registry (single source of truth) ----
+        self.distill_loss_flags = {
+            "cls_distill_loss": self.args.cls_dist,
+            "dfl_distill_loss": self.args.dfl_dist,
+            "m2d2_distill_loss": self.args.M2D2,
+            "box_reg_distill_loss": self.args.l2_dist,
+            "feat_l2_loss": self.args.feat,
+            "feat_att_loss": self.args.feat_att,
+            "feat_other_loss": self.args.feat_oth,
+        }
+
+        # ---- Write CSV header dynamically based on enabled losses ----
+        active_columns = ["epoch"] + [
+            name for name, enabled in self.distill_loss_flags.items() if enabled
+        ]
+
         with open(self.distill_csv, "w") as f:
-            f.write("epoch,cls_distill_loss,dfl_distill_loss,box_reg_distill_loss\n")
+            f.write(",".join(active_columns) + "\n")
+
         self.plot_idx = [0, 1, 2]
 
         # HUB
@@ -375,7 +733,31 @@ class BaseTrainer:
             self.run_callbacks("on_pretrain_routine_start")
 
         # self.teacher.args = self.args
+        # --------------------------------------------------
+        # Feature distillation modules (REGISTERED ONCE)
+        # --------------------------------------------------
+        if self.args.feat:
+            self.neck_adaptor = AutoNeckFeatureAdaptor(teacher_channels= [128, 256, 512] ,student_channels= [64, 128, 256])
 
+            self.fd_loss_fn = FeatureDistillationLoss(
+                loss_type=self.args.loss_ty,
+                level_weights=self.args.level_weights
+            )
+        if self.args.feat_att:
+            self.att_loss_fn = AttentionMapDistillationLoss(
+                loss_type=self.args.loss_ty,                      #l2 or "cosine"
+                level_weights= self.args.level_weights
+            )
+        if self.args.feat_oth:
+            self.neck_adaptor = AutoNeckFeatureAdaptor(teacher_channels= [128, 256, 512] ,student_channels= [64, 128, 256])
+            self.kd_loss_fn = UnifiedNeckDistillation(
+                    use_cwd=self.args.use_cwd, # Channel-Wise Distillation (CWD)
+                    use_crd=self.args.use_crd, # Correlation / Relational Distillation (CRD-style)
+                    use_mmd=self.args.use_mmd, # Feature Distribution Matching (MMD)
+                    use_spatial_att=self.args.use_spatial_att, # Spatial Softmax Attention Distillation
+                    use_channel_att=self.args.use_channel_att, # Channel Attention Distillation (SE-style)
+                    level_weights= self.args.level_weights
+                )
     def add_callback(self, event: str, callback):
         """Append the given callback to the event's callback list."""
         self.callbacks[event].append(callback)
@@ -452,11 +834,15 @@ class BaseTrainer:
         """Build dataloaders and optimizer on correct rank process."""
         ckpt = self.setup_model()
         self.model = self.model.to(self.device)
+        self.model.feat_distill = self.args.feat_distill
+
         self.set_model_attributes()
 
         ckpt_teacher = self.setup_teacher()
         self.teacher.args = self.teacher_args
         self.teacher = self.teacher.to(self.device)
+        self.teacher.feat_distill = self.args.feat_distill
+
         self.set_teacher_attributes()
         for p in self.teacher.parameters():
             p.requires_grad = False
@@ -574,10 +960,13 @@ class BaseTrainer:
         self.optimizer.zero_grad()  # zero any resumed gradients to ensure stability on train start
         while True:
             self.epoch = epoch
-            # Epoch-level distillation loss accumulators
-            cls_distill_loss_epoch = 0.0
-            dfl_distill_loss_epoch = 0.0
-            box_reg_distill_loss_epoch = 0.0
+            # ---- Epoch-level distillation loss accumulators (dynamic) ----
+            epoch_distill_losses = {
+                name: 0.0
+                for name, enabled in self.distill_loss_flags.items()
+                if enabled
+            }
+
             self.run_callbacks("on_train_epoch_start")
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")  # suppress 'Detected lr_scheduler.step() before optimizer.step()'
@@ -596,9 +985,10 @@ class BaseTrainer:
                 LOGGER.info(self.progress_string())
                 pbar = TQDM(enumerate(self.train_loader), total=nb)
             self.tloss = None
-    
+            
             for i, batch in pbar:
                 self.run_callbacks("on_train_batch_start")
+
                 # Warmup
                 ni = i + nb * epoch
                 if ni <= nw:
@@ -611,19 +1001,29 @@ class BaseTrainer:
                         )
                         if "momentum" in x:
                             x["momentum"] = np.interp(ni, xi, [self.args.warmup_momentum, self.args.momentum])
-                cls_dist = False
-                cls_dist_kl = False
-                dfl_dist = False
-                M2D2 = False
-                l2_dist = False
-                cls_fg_mask = False  # Set to True to apply spatial foreground mask, False to disable
-                dfl_fg_mask = False
-                l2_fg_mask = False  # Set to False to disable spatial masking
-                feat_distill = True
+                
+                cls_dist = self.args.cls_dist
+                cls_dist_kl = self.args.cls_dist_kl
+                dfl_dist = self.args.dfl_dist
+                M2D2 = self.args.M2D2
+                l2_dist = self.args.l2_dist
+                cls_fg_mask = self.args.cls_fg_mask
+                dfl_fg_mask = self.args.dfl_fg_mask
+                l2_fg_mask = self.args.l2_fg_mask
+                feat_distill = self.args.feat_distill
+                feat = self.args.feat
+                feat_att = self.args.feat_att
+                feat_oth = self.args.feat_oth
+                feat_mask = self.args.feat_mask # None or mask
+                
                 # Forward
             
                 with autocast(self.amp):
+        
                     batch = self.preprocess_batch(batch)
+                    # Save
+                    # with open("batch.pkl", "wb") as f:
+                    #     pickle.dump(batch, f)
                     progress = (epoch + 1) / self.args.epochs
                     # Forward pass through student and teacher
                     student_out = self.model(batch)
@@ -632,33 +1032,66 @@ class BaseTrainer:
                         teacher_out = self.teacher(batch)
                     if feat_distill:
                         teacher_preds, teacher_necks = teacher_out[1]
+                        student_preds, student_necks = student_out[1]
                     else:
                         teacher_preds = teacher_out[1]
+                        student_preds = student_out[1]
+                
                     _, _, target_labels, target_bboxes, target_scores, t_mask, target_gt_idx, norm_align_metric = teacher_out[0]
-                    # torch.save({
-                    #     "target_labels": target_labels,
-                    #     "target_bboxes": target_bboxes,
-                    #     "target_scores": target_scores,
-                    #     "t_mask": t_mask,
-                    #     "target_gt_idx": target_gt_idx,
-                    #     "norm_align_metric": norm_align_metric,
-                    # }, "tensors.pt")
-                    mask = generate_masks_from_teacher_tal(t_mask, teacher_preds)
-                    # print(t_mask.shape, mask[0].shape)
+                    # TAL based mask for distillation
+                    mask = generate_masks_from_teacher_tal(t_mask, teacher_preds, mask_type= self.args.mask_type)
+                
                     # Standard YOLO loss & predictions
                     loss, self.loss_items, _ ,_,_,_,_,_= student_out[0]
                     self.loss = loss.sum()
-                    student_preds = student_out[1]
-                    if cls_dist == True:
-                        # --- class Distillation setup ---
-                        class_channels = self.data['nc']
-                        per_scale_weights = [1., 1., 1.]                                    
-                        alpha = 1.0 
-                        T = 1.0 
+                    # raw feature distilation starts here
+                    if feat:
+
+                        teacher_necks_adapted = self.neck_adaptor(
+                            teacher_necks,
+                        )
+
+                        fd_loss = self.fd_loss_fn(
+                            student_necks,
+                            teacher_necks_adapted,
+                            masks= mask if feat_mask else None
+                        )
+
+                        self.loss += self.args.feature_lambda * fd_loss
+                        epoch_distill_losses["feat_l2_loss"] += fd_loss.item()
+
+                    # --------------------------------------------------
+                    # Attention map distillation
+                    # --------------------------------------------------
+                    if feat_att:
                         
-                        # New option (set externally)
-                        # cls_dist_kl = True  -> use KL divergence distillation
-                        # cls_dist_kl = False -> use original BCE distillation
+                        att_loss = self.att_loss_fn(
+                            student_necks,
+                            teacher_necks,
+                            masks=mask if feat_mask else None
+                        )
+
+                        self.loss += self.args.feature_lambda * att_loss
+                        epoch_distill_losses["feat_att_loss"] += att_loss.item()
+
+                    if feat_oth :
+                
+                        teacher_necks_adapted = self.neck_adaptor(
+                            teacher_necks,
+                        )
+                        
+                        kd_loss = self.kd_loss_fn(
+                            student_necks,
+                            teacher_necks_adapted,
+                            masks=mask if feat_mask else None
+                        )
+                        epoch_distill_losses["feat_other_loss"] += kd_loss.item()
+                        self.loss += self.args.feature_lambda * kd_loss
+
+                    if cls_dist:
+                        # --- class Distillation setup ---
+                        class_channels = self.data['nc']                                    
+         
                         distill_cls_loss = 0.0
 
                         for i, (s_pred, t_pred) in enumerate(zip(student_preds, teacher_preds)):
@@ -671,7 +1104,7 @@ class BaseTrainer:
                                 #  ORIGINAL BCE-SIGMOID DISTILLATION
                                 ############################################################
                                 with torch.no_grad():
-                                    t_probs = torch.sigmoid(t_logits / T)
+                                    t_probs = torch.sigmoid(t_logits / self.args.cls_dist_t)
 
                                 bce = F.binary_cross_entropy_with_logits(
                                     s_logits, t_probs, reduction='none'
@@ -692,9 +1125,9 @@ class BaseTrainer:
                                 # Softmax across class channels
                                 # shape: [B, C, H, W]
                                 with torch.no_grad():
-                                    t_probs = F.softmax(t_logits / T, dim=1)
+                                    t_probs = F.softmax(t_logits / self.args.cls_dist_t, dim=1)
 
-                                s_log_probs = F.log_softmax(s_logits / T, dim=1)
+                                s_log_probs = F.log_softmax(s_logits / self.args.cls_dist_t, dim=1)
 
                                 # KL across class dimension (per pixel)
                                 # kl: [B, H, W]
@@ -702,7 +1135,7 @@ class BaseTrainer:
                                 kl = kl.sum(dim=1)  # sum over class dimension → [B, H, W]
 
                                 # Temperature correction (standard in Hinton KD)
-                                kl = kl * (T * T)
+                                kl = kl * (self.args.cls_dist_t * self.args.cls_dist_t)
 
                                 if cls_fg_mask:
                                     fg_mask = mask[i]  # [B,1,H,W]
@@ -713,13 +1146,16 @@ class BaseTrainer:
                                     loss_ = kl.mean()
 
                             # Weighted accumulation
-                            distill_cls_loss += per_scale_weights[i] * loss_
+                            distill_cls_loss += self.args.level_weights[i] * loss_
 
                         # --- Final loss combination ---
-                        self.loss += alpha * distill_cls_loss
+                        self.loss += self.args.cls_alpha * distill_cls_loss
                         
                         # Optional logging
-                        cls_distill_loss_epoch += (alpha * distill_cls_loss.item())
+                        epoch_distill_losses["cls_distill_loss"] += (
+                            self.args.cls_alpha * distill_cls_loss.item()
+                        )
+
                     if M2D2 == True:
                         # flatten each tensor to [4, -1]
                         flat_masks = [m.view(m.size(0), -1) for m in mask]
@@ -802,8 +1238,6 @@ class BaseTrainer:
                             updated_preds.append(new_feat)
                         # ----- M2D2 distillation starts here -----
                         reg_max = 16
-                        T = 1.0 
-                        lambda_d = 0.5
 
                         dfl_distill_loss = 0.0
                         count = 0
@@ -825,8 +1259,8 @@ class BaseTrainer:
 
                             # Compute KL divergence per location and coordinate
                             with torch.no_grad():
-                                tp_soft = torch.softmax(tp_reshaped / T, dim=2)  # [B, 4, reg_max, H, W]
-                            sp_logsoft = torch.log_softmax(sp_reshaped / T, dim=2)  # [B, 4, reg_max, H, W]
+                                tp_soft = torch.softmax(tp_reshaped / self.args.m2d2_t, dim=2)  # [B, 4, reg_max, H, W]
+                            sp_logsoft = torch.log_softmax(sp_reshaped / self.args.m2d2_t, dim=2)  # [B, 4, reg_max, H, W]
 
                             # KL divergence: [B, 4, H, W] (sum over reg_max)
                             kl_per_pixel = torch.sum(tp_soft * (torch.log(tp_soft + 1e-8) - sp_logsoft), dim=2)  # [B, 4, H, W]
@@ -846,7 +1280,7 @@ class BaseTrainer:
                                 loss_kl = kl_spatial.mean()
 
                             # Scale by T^2 (standard in distillation)
-                            loss_kl = loss_kl * (T ** 2)
+                            loss_kl = loss_kl * (self.args.m2d2_t ** 2)
 
                             dfl_distill_loss += loss_kl
                             count += 1
@@ -856,19 +1290,18 @@ class BaseTrainer:
                             dfl_distill_loss = dfl_distill_loss / count
 
                         # Final weight
-                        dfl_distill_loss = lambda_d * dfl_distill_loss
+                        dfl_distill_loss = self.args.m2d2_alpha * dfl_distill_loss
 
                         # Add to total loss
                         self.loss += dfl_distill_loss
 
                         # Accumulate epoch-level DFL KD loss
-                        dfl_distill_loss_epoch += dfl_distill_loss.item()
+                        epoch_distill_losses["m2d2_distill_loss"] += dfl_distill_loss.item()
                         # M2D2 distillation ends here                
                     if dfl_dist == True:
                         # ----- DFL distillation starts here -----
                         reg_max = 16
                         T = 1.0 
-                        lambda_d = 0.5
 
                         dfl_distill_loss = 0.0
                         count = 0
@@ -890,8 +1323,8 @@ class BaseTrainer:
 
                             # Compute KL divergence per location and coordinate
                             with torch.no_grad():
-                                tp_soft = torch.softmax(tp_reshaped / T, dim=2)  # [B, 4, reg_max, H, W]
-                            sp_logsoft = torch.log_softmax(sp_reshaped / T, dim=2)  # [B, 4, reg_max, H, W]
+                                tp_soft = torch.softmax(tp_reshaped / self.args.dfl_t, dim=2)  # [B, 4, reg_max, H, W]
+                            sp_logsoft = torch.log_softmax(sp_reshaped / self.args.dfl_t, dim=2)  # [B, 4, reg_max, H, W]
 
                             # KL divergence: [B, 4, H, W] (sum over reg_max)
                             kl_per_pixel = torch.sum(tp_soft * (torch.log(tp_soft + 1e-8) - sp_logsoft), dim=2)  # [B, 4, H, W]
@@ -911,7 +1344,7 @@ class BaseTrainer:
                                 loss_kl = kl_spatial.mean()
 
                             # Scale by T^2 (standard in distillation)
-                            loss_kl = loss_kl * (T ** 2)
+                            loss_kl = loss_kl * (self.args.dfl_t ** 2)
 
                             dfl_distill_loss += loss_kl
                             count += 1
@@ -921,18 +1354,17 @@ class BaseTrainer:
                             dfl_distill_loss = dfl_distill_loss / count
 
                         # Final weight
-                        dfl_distill_loss = lambda_d * dfl_distill_loss
+                        dfl_distill_loss = self.args.dfl_alpha * dfl_distill_loss
 
                         # Add to total loss
                         self.loss += dfl_distill_loss
 
                         # Accumulate epoch-level DFL KD loss
-                        dfl_distill_loss_epoch += dfl_distill_loss.item()
+                        epoch_distill_losses["dfl_distill_loss"] += dfl_distill_loss.item()
                         # dfl distillation ends here
                     if l2_dist == True:
                         # ----- L2 box regression distillation starts here -----
                         reg_max = 16
-                        λ_box_reg = 1.0
                         
                         box_reg_loss = 0.0
                         count = 0
@@ -987,12 +1419,12 @@ class BaseTrainer:
                             box_reg_loss = box_reg_loss / count
 
                         # Apply final weight
-                        box_reg_loss = λ_box_reg * box_reg_loss
+                        box_reg_loss = self.args.l2_alpha * box_reg_loss
 
                         self.loss += box_reg_loss
 
                         # Accumulate epoch-level box regression KD loss
-                        box_reg_distill_loss_epoch += box_reg_loss.item()
+                        epoch_distill_losses["box_reg_distill_loss"] += box_reg_loss.item()
                         #regression distillation ends here
                     # self.loss = loss.sum()
                     if RANK != -1:
@@ -1039,21 +1471,22 @@ class BaseTrainer:
                 self.run_callbacks("on_train_batch_end")
             # Log epoch-level distillation losses
             if RANK in {-1, 0}:
-                LOGGER.info(
-                    f"Epoch {epoch + 1}: "
-                    f"cls_distill_loss_epoch={cls_distill_loss_epoch:.6f}, "
-                    f"dfl_distill_loss_epoch={dfl_distill_loss_epoch:.6f}, "
-                    f"box_reg_distill_loss_epoch={box_reg_distill_loss_epoch:.6f}"
-                )
-            
-            if RANK in {-1, 0}:  # Only main process logs to file
-                with open(self.distill_csv, "a") as f:
-                    f.write(
-                        f"{epoch + 1},"
-                        f"{cls_distill_loss_epoch:.6f},"
-                        f"{dfl_distill_loss_epoch:.6f},"
-                        f"{box_reg_distill_loss_epoch:.6f}\n"
+                if epoch_distill_losses:
+                    log_str = ", ".join(
+                        f"{k}={v:.6f}" for k, v in epoch_distill_losses.items()
                     )
+                    LOGGER.info(f"Epoch {epoch + 1}: {log_str}")
+
+            if RANK in {-1, 0}:  # Only main process logs to file
+                row = [str(epoch + 1)] + [
+                    f"{epoch_distill_losses[name]:.6f}"
+                    for name, enabled in self.distill_loss_flags.items()
+                    if enabled
+                ]
+
+                with open(self.distill_csv, "a") as f:
+                    f.write(",".join(row) + "\n")
+
             self.lr = {f"lr/pg{ir}": x["lr"] for ir, x in enumerate(self.optimizer.param_groups)}  # for loggers
             self.run_callbacks("on_train_epoch_end")
             if RANK in {-1, 0}:
@@ -1506,6 +1939,28 @@ class BaseTrainer:
 
         optimizer.add_param_group({"params": g[0], "weight_decay": decay})  # add g0 with weight_decay
         optimizer.add_param_group({"params": g[1], "weight_decay": 0.0})  # add g1 (BatchNorm2d weights)
+        # --------------------------------------------
+        # Add feature distillation adaptor parameters
+        # --------------------------------------------
+        if hasattr(self, "neck_adaptor"):
+            optimizer.add_param_group(
+                {
+                    "params": self.neck_adaptor.parameters(),
+                    "weight_decay": decay,
+                }
+            )
+
+        # >>> ADD THIS BLOCK HERE <<<
+        if hasattr(self, "neck_adaptor"):
+            found = False
+            target = self.neck_adaptor.adaptors[0].weight
+            for pg in optimizer.param_groups:
+                if any(p is target for p in pg["params"]):
+                    print("Adaptor LR:", pg["lr"])
+                    found = True
+            assert found, "Neck adaptor NOT in optimizer param groups"
+        # >>> END BLOCK <<<
+        
         LOGGER.info(
             f"{colorstr('optimizer:')} {type(optimizer).__name__}(lr={lr}, momentum={momentum}) with parameter groups "
             f"{len(g[1])} weight(decay=0.0), {len(g[0])} weight(decay={decay}), {len(g[2])} bias(decay=0.0)"

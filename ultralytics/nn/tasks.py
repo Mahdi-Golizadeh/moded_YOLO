@@ -154,9 +154,10 @@ class BaseModel(torch.nn.Module):
         """
         if augment:
             return self._predict_augment(x)
-        return self._predict_once(x, profile, visualize, embed)
+        
+        return self._predict_once(x, profile, visualize, embed, return_neck_feats=getattr(self, "feat_distill", False))
 
-    def _predict_once(self, x, profile=False, visualize=False, embed=None, return_neck_feats=True):
+    def _predict_once(self, x, profile=False, visualize=False, embed=None, return_neck_feats=False):
         """
         Perform a forward pass through the network.
 
@@ -169,6 +170,8 @@ class BaseModel(torch.nn.Module):
         Returns:
             (torch.Tensor): The last output of the model.
         """
+        # return_neck_feats=getattr(self.args, "feat_distill", False)
+        # return_neck_feats=True
         distill_layers = {16, 19, 22}
         y, dt, embeddings = [], [], []  # outputs
         neck_feats = [] if return_neck_feats else None

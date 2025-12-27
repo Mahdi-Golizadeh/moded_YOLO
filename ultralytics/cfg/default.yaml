@@ -42,6 +42,37 @@ overlap_mask: True # (bool) merge object masks into a single image mask during t
 mask_ratio: 4 # (int) mask downsample ratio (segment train only)
 # Classification
 dropout: 0.0 # (float) use dropout regularization (classify train only)
+# i added the followings
+cls_dist : False
+cls_dist_kl : False
+dfl_dist : False,
+M2D2 : False
+l2_dist : False
+cls_fg_mask : False  # Set to True to apply spatial foreground mask, False to disable
+dfl_fg_mask : False
+l2_fg_mask : False  # Set to False to disable spatial masking
+feat_distill : False # to enable neck features return and avoid code breaking
+feat : False # calculate whole feature maps and supports masking
+feat_att : False # calculates attention maps and supports masking
+feat_oth : False
+feat_mask : None
+loss_ty : "l2"
+teacher_model : ""
+use_cwd : False, # Channel-Wise Distillation (CWD)
+use_crd : False, # Correlation / Relational Distillation (CRD-style)
+use_mmd : False, # Feature Distribution Matching (MMD)
+use_spatial_att : False, # Spatial Softmax Attention Distillation
+use_channel_att : False, # Channel Attention Distillation (SE-style)
+level_weights : [1., 1., 1.] # channel weights for all feature distillation and cls distillation
+feature_lambda : 1. # feature loss weight multiplier
+cls_dist_t : 1.
+cls_alpha : 1.
+m2d2_t : 1.
+m2d2_alpha : 1.
+dfl_t : 1.
+dfl_alpha : 1.
+l2_alpha : 1.
+mask_type : "original"
 
 # Val/Test settings ----------------------------------------------------------------------------------------------------
 val: True # (bool) validate/test during training
